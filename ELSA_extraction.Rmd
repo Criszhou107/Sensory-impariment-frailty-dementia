@@ -1,0 +1,3290 @@
+---
+title: "ELSA Data Extraction Pipeline"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r}
+library(haven)
+library(dplyr)
+library(labelled)
+library(tidyverse)
+library(stringr)
+library(mice)
+library(lubridate)
+library(msm)
+library(survival)
+library(survminer)
+library(scales)
+
+```
+
+
+
+```{r}
+# ==========================================================================
+# USER CONFIGURATION
+# Set the ELSA_DATA_DIR environment variable to your local UKDA-5050 Stata
+# directory before running, e.g. in your ~/.Renviron or shell profile:
+#   ELSA_DATA_DIR="/path/to/UKDA-5050-stata/stata/stata13_se"
+# Alternatively, hard-code the path here (but do NOT commit it to Git).
+# ==========================================================================
+data_dir <- Sys.getenv("ELSA_DATA_DIR", unset = stop(
+  "Please set the ELSA_DATA_DIR environment variable to your local ",
+  "UKDA-5050 Stata directory. See README.md for instructions."
+))
+
+# 1. Index file: primary source for death status (waves 0-5)
+#    mortwave > 0 means died; first digit = inter-wave period
+#    1x=pre-W1, 2x=W1-W2, 3x=W2-W3, 4x=W3-W4, 5x=W4-W5, 6x=W5-W6
+# ==========================================================================
+idx <- read_dta(file.path(data_dir, "index_file_wave_0-wave_5_v2.dta"))
+
+idx_deaths <- idx %>%
+  transmute(
+    idauniq = as.numeric(idauniq),
+    mortwave = mortwave,
+    died_idx = if_else(mortwave > 0, 1L, 0L),
+    death_year_approx = case_when(
+      floor(mortwave / 10) == 1 ~ 2002,
+      floor(mortwave / 10) == 2 ~ 2004,
+      floor(mortwave / 10) == 3 ~ 2006,
+      floor(mortwave / 10) == 4 ~ 2008,
+      floor(mortwave / 10) == 5 ~ 2010,
+      floor(mortwave / 10) == 6 ~ 2012,
+      TRUE                      ~ NA_real_
+    )
+  )
+
+# ==========================================================================
+# 2. EOL archive files: actual death year and season
+read_eol <- function(file) {
+  d <- read_dta(file.path(data_dir, file))
+  cn <- names(d)
+  year_col   <- cn[tolower(cn) == "eidatey"][1]
+  season_col <- cn[tolower(cn) %in% c("dveidates", "eidates")][1]
+  out <- d %>% transmute(idauniq = idauniq)
+  if (!is.na(year_col)) {
+    out$death_year_eol <- if_else(d[[year_col]] > 0, as.numeric(d[[year_col]]), NA_real_)
+  } else { out$death_year_eol <- NA_real_ }
+  if (!is.na(season_col)) {
+    out$death_season <- if_else(d[[season_col]] > 0, as.integer(d[[season_col]]), NA_integer_)
+  } else { out$death_season <- NA_integer_ }
+  out %>% filter(!is.na(death_year_eol))
+}
+
+eol_all <- bind_rows(
+  read_eol("elsa_eol_w2_archive_v1.dta"),
+  read_eol("elsa_eol_w3_archive_v1.dta"),
+  read_eol("elsa_eol_w4_archive_v1.dta"),
+  read_eol("elsa_endoflife_w6archive.dta"),
+  read_eol("elsa_endoflife_hcap2_w10.dta")
+) %>%
+  group_by(idauniq) %>%
+  slice_max(order_by = death_year_eol, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+h_eol <- read_dta(file.path(data_dir, "h_elsa_eol_a2.dta")) %>%
+  transmute(
+    idauniq,
+    death_year_heol   = if_else(raxyear > 0, as.numeric(raxyear), NA_real_),
+    death_season_heol = if_else(raxseason > 0, as.integer(raxseason), NA_integer_),
+    death_age         = if_else(radage > 0, as.numeric(radage), NA_real_)
+  )
+
+# ==========================================================================
+# 3. Track last productive interview across all waves
+wave_ids <- list(
+  list(file = "wave_1_core_data_v3.dta",        wave = 1, year = 2002),
+  list(file = "wave_2_core_data_v4.dta",         wave = 2, year = 2004),
+  list(file = "wave_3_elsa_data_v4.dta",         wave = 3, year = 2006),
+  list(file = "wave_4_elsa_data_v3.dta",         wave = 4, year = 2008),
+  list(file = "wave_5_elsa_data_v4.dta",         wave = 5, year = 2010),
+  list(file = "wave_6_elsa_data_v2.dta",         wave = 6, year = 2012),
+  list(file = "wave_7_elsa_data.dta",            wave = 7, year = 2014),
+  list(file = "wave_8_elsa_data_eul_v2.dta",     wave = 8, year = 2016),
+  list(file = "wave_9_elsa_data_eul_v2.dta",     wave = 9, year = 2018),
+  list(file = "wave_10_elsa_data_eul_v4.dta",    wave = 10, year = 2020),
+  list(file = "wave_11_elsa_data_eul_v1.dta",    wave = 11, year = 2022)
+)
+
+last_alive <- purrr::map_dfr(wave_ids, function(w) {
+  d <- read_dta(file.path(data_dir, w$file))
+  tibble(idauniq = as.numeric(d$idauniq), wave = w$wave, wave_year = w$year)
+}) %>%
+  group_by(idauniq) %>%
+  summarise(lastalive_wave = max(wave), lastalive_year = max(wave_year), .groups = "drop")
+
+# ==========================================================================
+# 4. Combine all sources into death_track
+death_track_elsa <- last_alive %>%
+  full_join(idx_deaths, by = "idauniq") %>%
+  left_join(h_eol, by = "idauniq") %>%
+  left_join(eol_all, by = "idauniq") %>%
+  mutate(
+    died = case_when(
+      died_idx == 1 ~ 1L, !is.na(death_year_heol) ~ 1L, !is.na(death_year_eol) ~ 1L, TRUE ~ 0L
+    ),
+    death_year = coalesce(death_year_heol, death_year_eol, death_year_approx),
+    death_year = if_else(died == 1L, death_year, NA_real_),
+    death_season = coalesce(death_season_heol, death_season),
+    death_month = case_when(
+      death_season == 1 ~ 1, death_season == 2 ~ 4, death_season == 3 ~ 7,
+      death_season == 4 ~ 10, died == 1 ~ 6, TRUE ~ NA_real_
+    )
+  ) %>%
+  select(idauniq, died, death_year, death_month, death_season, death_age,
+         lastalive_wave, lastalive_year, mortwave)
+
+```
+
+
+
+# From 2004 as baseline start-point wave 2
+```{r}
+# 1. Load data files
+elsa_core    <- read_dta(file.path(data_dir, "wave_2_core_data_v4.dta"))
+elsa_derived <- read_dta(file.path(data_dir, "wave_2_derived_variables.dta"))
+
+# 2. Covariates (analogous to hrs_cov_2004)
+#   indsex      (1=Male, 2=Female)
+#   w2edqual    (recoded to 3 levels: 0/1/2)
+#   indobyr     (year of birth)
+#   DiMar       (marital status)
+#   wpdes       (employment description)
+#   HESka       (current smoker)
+#   scal7a      (drank in last 7 days)
+#   HeActa      (vigorous physical activity)
+#   scorg01-scorg09 (social/org membership)
+
+elsa_cov_2004 <- elsa_core %>%
+  left_join(
+    elsa_derived %>% select(idauniq, w2edqual, palevel, heoptgl, heoptca),
+    by = "idauniq"
+  ) %>%
+  transmute(
+    idauniq    = idauniq,
+    year       = 2004L,
+    birth_year = if_else(indobyr > 0, as.numeric(indobyr), NA_real_),
+    age_2004   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    # --- Gender (HRS: RAGENDER 1=Male 2=Female → same in ELSA: indsex) ---
+    Gender = case_when(indsex %in% c(1, 2) ~ as.integer(indsex), TRUE ~ NA_integer_),
+
+    # --- Education (HRS: RAEDUC 1=lt HS / 2=GED-HS / 3+=some college+) ---
+    # ELSA w2edqual: 1=Degree+ / 2=Higher ed below degree / 3=A-Level
+    #               4=O-Level / 5=CSE / 6=Foreign/other / 7=No qualification
+    # Recode to 3 levels to match HRS:
+    #   0 = No qualification (HRS: less than high school)
+    #   1 = O-Level/CSE/Foreign (HRS: GED or high school)
+    #   2 = A-Level or above (HRS: some college+)
+    Education = case_when(
+      is.na(w2edqual) | w2edqual < 0 ~ NA_integer_,
+      w2edqual == 7 ~ 0L, w2edqual %in% c(4, 5, 6) ~ 1L, w2edqual %in% c(1, 2, 3) ~ 2L, TRUE ~ NA_integer_
+    ),
+
+    # --- Marital status (HRS: R7MSTAT 1=married → 1; else → 0) ---
+    # ELSA DiMar: 1=Single / 2=Married 1st / 3=Remarried / 4=Separated
+    #            5=Divorced / 6=Widowed
+    Marital_status = case_when(DiMar %in% c(2, 3) ~ 1L, DiMar %in% c(1, 4, 5, 6) ~ 0L, TRUE ~ NA_integer_),
+
+    # --- Employment (HRS: R7WORK 1=working → 1; 0 → 0) ---
+    # ELSA wpdes: 2=Employed / 3=Self-employed → working
+    Employment = case_when(wpdes %in% c(2, 3) ~ 1L, wpdes > 0 ~ 0L, TRUE ~ NA_integer_),
+
+    # --- Smoking (HRS: R7SMOKEN 1=current smoker) ---
+    # ELSA HESka: 1=Yes smokes now / 2=No
+    Smoking = case_when(HESka == 1 ~ 1L, HESka == 2 ~ 0L, TRUE ~ NA_integer_),
+
+    # --- Alcohol (HRS: R7DRINKD >0 → 1; ==0 → 0) ---
+    # ELSA scal7a: 1=drank in last 7 days / 2=did not
+    Alcohol = case_when(scal7a == 1 ~ 1L, scal7a == 2 ~ 0L, TRUE ~ NA_integer_),
+
+    # --- Physical activity (HRS: R7VGACTX 1-3 → 1; 4-5 → 0) ---
+    # ELSA HeActa (vigorous activity frequency):
+    #   1=more than once/week, 2=once/week, 3=1-3 times/month → active (1)
+    #   4=hardly ever/never → inactive (0)
+    Physical_activity = case_when(HeActa %in% c(1, 2, 3) ~ 1L, HeActa == 4 ~ 0L, TRUE ~ NA_integer_),
+
+    # --- Social activity (HRS: R7CACT==1 or R7FCACT in 1,2 → 1) ---
+    # ELSA scorg01-scorg09: membership in various organisations (0=No, 1=Yes)
+    # scorg09 = "not a member of any" — if any of scorg01-08 == 1 → active
+    Social_activity = case_when(
+      scorg01==1|scorg02==1|scorg03==1|scorg04==1|scorg05==1|scorg06==1|scorg07==1|scorg08==1 ~ 1L,
+      scorg09==1 ~ 0L, scorg01==0&scorg02==0&scorg03==0&scorg04==0&scorg05==0&scorg06==0&scorg07==0&scorg08==0 ~ 0L,
+      TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, year, birth_year, age_2004, Gender, Education, Marital_status, Employment, Smoking, Alcohol, Physical_activity, Social_activity)
+
+
+# 3. Sensory variables (analogous to sensory_var_2004)
+#   Hehear   (self-rated hearing)
+#   Heeye    (self-rated eyesight)
+#   heoptca  (ever reported cataract, derived)
+#   heoptgl  (ever reported glaucoma, derived)
+
+sensory_var_2004 <- elsa_core %>%
+  left_join(elsa_derived %>% select(idauniq, heoptca, heoptgl), by = "idauniq") %>%
+  transmute(
+    idauniq = idauniq,
+
+    # Hearing loss: Hehear 1-3 (Excellent/Very good/Good) → 0; 4-5 (Fair/Poor) → 1
+    hearing_loss = case_when(Hehear %in% c(1,2,3) ~ 0L, Hehear %in% c(4,5) ~ 1L, TRUE ~ NA_integer_),
+
+    # Overall vision: Heeye 1-3 → 0 (good); 4-6 → 1 (poor/blind)
+    vision_overall = case_when(Heeye %in% c(1,2,3) ~ 0L, Heeye %in% c(4,5,6) ~ 1L, TRUE ~ NA_integer_),
+
+    # Cataract (diagnosed): heoptca 1 or 2 (reported by W1 or W2) → 1; 0 → 0
+    cataract_surgery = case_when(heoptca %in% c(1,2) ~ 1L, heoptca == 0 ~ 0L, TRUE ~ NA_integer_),
+
+    # Glaucoma (diagnosed): heoptgl 1 or 2 (reported by W1 or W2) → 1; 0 → 0
+    glaucoma_treatment = case_when(heoptgl %in% c(1,2) ~ 1L, heoptgl == 0 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall, cataract_surgery, glaucoma_treatment)
+
+# 4. Dementia classification (ELSA-specific)
+# Dementia is defined as EITHER:
+#   (a) Self-report of physician diagnosis of dementia/Alzheimer's
+#       → derived variables hedibde (dementia/memory impairment) or
+#         hedibad (Alzheimer's disease): values 1 or 2 = ever reported
+#   (b) Mean score >= 3.4 on the 16-item IQCODE (Heiqb–Heiqq)
+#       scored 1=Much improved to 5=Much worse (3=No change)
+#       A mean >= 3.4 indicates cognitive decline indicating dementia
+
+elsa_cog_2004 <- elsa_core %>%
+  left_join(elsa_derived %>% select(idauniq, hedibad, hedibde), by = "idauniq") %>%
+  transmute(
+    idauniq = idauniq, year = 2004L,
+    diagnosed_dementia = case_when(hedibad %in% c(1,2)|hedibde %in% c(1,2) ~ 1L, hedibad==0&hedibde==0 ~ 0L, TRUE ~ NA_integer_),
+    iqcode_b=if_else(Heiqb %in% 1:5,as.numeric(Heiqb),NA_real_), iqcode_c=if_else(Heiqc %in% 1:5,as.numeric(Heiqc),NA_real_),
+    iqcode_d=if_else(Heiqd %in% 1:5,as.numeric(Heiqd),NA_real_), iqcode_e=if_else(Heiqe %in% 1:5,as.numeric(Heiqe),NA_real_),
+    iqcode_f=if_else(Heiqf %in% 1:5,as.numeric(Heiqf),NA_real_), iqcode_g=if_else(Heiqg %in% 1:5,as.numeric(Heiqg),NA_real_),
+    iqcode_h=if_else(Heiqh %in% 1:5,as.numeric(Heiqh),NA_real_), iqcode_i=if_else(Heiqi %in% 1:5,as.numeric(Heiqi),NA_real_),
+    iqcode_j=if_else(Heiqj %in% 1:5,as.numeric(Heiqj),NA_real_), iqcode_k=if_else(Heiqk %in% 1:5,as.numeric(Heiqk),NA_real_),
+    iqcode_l=if_else(Heiql %in% 1:5,as.numeric(Heiql),NA_real_), iqcode_m=if_else(Heiqm %in% 1:5,as.numeric(Heiqm),NA_real_),
+    iqcode_n=if_else(Heiqn %in% 1:5,as.numeric(Heiqn),NA_real_), iqcode_o=if_else(Heiqo %in% 1:5,as.numeric(Heiqo),NA_real_),
+    iqcode_p=if_else(Heiqp %in% 1:5,as.numeric(Heiqp),NA_real_), iqcode_q=if_else(Heiqq %in% 1:5,as.numeric(Heiqq),NA_real_)
+  ) %>% rowwise() %>%
+  mutate(iqcode_n_valid=sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean=if_else(iqcode_n_valid>=1,mean(c_across(iqcode_b:iqcode_q),na.rm=TRUE),NA_real_)) %>% ungroup() %>%
+  mutate(iqcode_dementia=case_when(is.na(iqcode_mean)~NA_integer_,iqcode_mean>=3.4~1L,iqcode_mean<3.4~0L),
+    dementia=case_when(diagnosed_dementia ==1|iqcode_dementia == 1~1L,diagnosed_dementia == 0|iqcode_dementia == 0~0L,TRUE~NA_integer_)) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+```
+
+
+
+# Frailty Index
+```{r}
+# 1. Mobility difficulties (Items 1–10)
+# W2 uses mention format: heada01-heada10, value = activity code
+# ==========================================================================
+has_mention <- function(df, mention_cols, code) {
+  mat <- as.matrix(df[, mention_cols])
+  present <- apply(mat, 1, function(row) any(row == code, na.rm = TRUE))
+  all_na  <- apply(mat, 1, function(row) all(row < 0 | is.na(row)))
+  result  <- if_else(present, 1L, if_else(all_na, NA_integer_, 0L))
+  has_none <- apply(mat, 1, function(row) any(row == 96, na.rm = TRUE))
+  result <- if_else(has_none & !present, 0L, result)
+  result
+}
+
+mob_cols <- paste0("heada", sprintf("%02d", 1:10))
+
+elsa_fi <- elsa_core %>%
+  select(idauniq, all_of(mob_cols)) %>%
+  mutate(
+    hemobwa = has_mention(cur_data(), mob_cols, 1),
+    hemobsi = has_mention(cur_data(), mob_cols, 2),
+    hemobch = has_mention(cur_data(), mob_cols, 3),
+    hemobcs = has_mention(cur_data(), mob_cols, 4),
+    hemobcl = has_mention(cur_data(), mob_cols, 5),
+    hemobst = has_mention(cur_data(), mob_cols, 6),
+    hemobre = has_mention(cur_data(), mob_cols, 7),
+    hemobpu = has_mention(cur_data(), mob_cols, 8),
+    hemobli = has_mention(cur_data(), mob_cols, 9),
+    hemobpi = has_mention(cur_data(), mob_cols, 10)
+  ) %>%
+  select(idauniq, starts_with("hemob"))
+
+# ==========================================================================
+# 2. ADL & IADL difficulties (Items 11–23)
+# ==========================================================================
+adl_cols <- paste0("headb", sprintf("%02d", 1:13))
+
+adl_iadl <- elsa_core %>%
+  select(idauniq, all_of(adl_cols)) %>%
+  mutate(
+    headldr = has_mention(cur_data(), adl_cols, 1),
+    headlwa = has_mention(cur_data(), adl_cols, 2),
+    headlba = has_mention(cur_data(), adl_cols, 3),
+    headlea = has_mention(cur_data(), adl_cols, 4),
+    headlbe = has_mention(cur_data(), adl_cols, 5),
+    headlwc = has_mention(cur_data(), adl_cols, 6),
+    headlma = has_mention(cur_data(), adl_cols, 7),
+    headlpr = has_mention(cur_data(), adl_cols, 8),
+    headlsh = has_mention(cur_data(), adl_cols, 9),
+    headlph = has_mention(cur_data(), adl_cols, 10),
+    headlme = has_mention(cur_data(), adl_cols, 11),
+    headlhg = has_mention(cur_data(), adl_cols, 12),
+    headlmo = has_mention(cur_data(), adl_cols, 13)
+  ) %>%
+  select(idauniq, starts_with("headl"))
+
+# ==========================================================================
+# 3. Diagnosed conditions (Items 24–36) — from derived file
+# ==========================================================================
+recode_dx <- function(x) {
+  case_when(
+    x %in% c(1, 2) ~ 1L,
+    x == 0          ~ 0L,
+    TRUE            ~ NA_integer_
+  )
+}
+
+diagnoses <- elsa_derived %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx))
+
+# ==========================================================================
+# 4. CES-D depression items (Items 37–44)
+# ==========================================================================
+cesd <- elsa_core %>%
+  select(idauniq, PScedA, PScedB, PScedC, PScedD,
+         PScedE, PScedF, PScedG, PScedH) %>%
+  mutate(
+    # Standard items: Yes(1) = deficit
+    psceda = case_when(PScedA == 1 ~ 1L, PScedA == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(PScedB == 1 ~ 1L, PScedB == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(PScedC == 1 ~ 1L, PScedC == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(PScedE == 1 ~ 1L, PScedE == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(PScedG == 1 ~ 1L, PScedG == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(PScedH == 1 ~ 1L, PScedH == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: No(2) = deficit (was not happy / did not enjoy life)
+    pscedd = case_when(PScedD == 2 ~ 1L, PScedD == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(PScedF == 2 ~ 1L, PScedF == 1 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd, pscede, pscedf, pscedg, pscedh)
+
+# ==========================================================================
+# 5. Other health items (Items 45, 48–51)
+#    Excluded: #46 heeye (sensory), #47 hehear (sensory)
+# ==========================================================================
+other_health <- elsa_core %>%
+  select(idauniq, Hehelf, HeFla, HeFrac, HeJi, MmPain) %>%
+  mutate(
+    hehelf = case_when(
+      Hehelf %in% c(1, 2, 3) ~ 0L,
+      Hehelf %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(HeFla  == 1 ~ 1L, HeFla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(HeFrac == 1 ~ 1L, HeFrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(HeJi   == 1 ~ 1L, HeJi   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(MmPain == 1 ~ 1L, MmPain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# ==========================================================================
+# 6. Merge all components and compute Frailty Index
+# ==========================================================================
+fi_items <- c(
+  "hemobwa", "hemobsi", "hemobch", "hemobcs", "hemobcl",
+  "hemobst", "hemobre", "hemobpu", "hemobli", "hemobpi",
+  "headldr", "headlwa", "headlba", "headlea", "headlbe", "headlwc",
+  "headlma", "headlpr", "headlsh", "headlph", "headlme", "headlhg", "headlmo",
+  "hedimbp", "hediman", "hedimmi", "hedimhf", "hedimar",
+  "hedimdi", "hedimst", "hediblu", "hedibas", "hedibar", "hedibos", "hedibca", "hedibps",
+  "psceda", "pscedb", "pscedc", "pscedd", "pscede", "pscedf", "pscedg", "pscedh",
+  "hehelf", "hefla", "hefrac", "heji", "mmpain"
+)
+
+n_fi_items <- length(fi_items)  # 49
+
+elsa_fi_2004 <- elsa_fi %>%
+  left_join(adl_iadl,     by = "idauniq") %>%
+  left_join(diagnoses,    by = "idauniq") %>%
+  left_join(cesd,         by = "idauniq") %>%
+  left_join(other_health, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2004L,
+    # Require at least 80% non-missing (>= 40 of 49 items)
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    # Binary frailty classification: >= 0.25 → frail (1), < 0.25 → non-frail (0)
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  # Exclude participants who did not meet the 80% threshold
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+```
+
+
+
+# Merge 2004 data
+```{r}
+# include 9,432 participants
+elsa_2004 <- elsa_cov_2004 %>%
+  left_join(sensory_var_2004, by = "idauniq") %>%
+  left_join(elsa_cog_2004, by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2004, by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+# Include 9,203 participants (exclude missing data of dementia and frailty)
+
+# 1. Build imputation dataset
+# ==========================================================================
+imp04_elsa <- elsa_2004 %>% mutate(idauniq=as.character(idauniq)) %>%
+  transmute(idauniq, Gender, age_2004=as.numeric(age_2004), Education=ordered(Education),
+    across(c(Marital_status,Employment,Smoking,Alcohol,Physical_activity,Social_activity,frailty,dementia),~factor(.x,levels=c(0,1)))) %>%
+  mutate(Gender=factor(Gender,levels=c(1,2)))
+
+# ==========================================================================
+# 2. Define imputation methods
+meth <- make.method(imp04_elsa)
+
+# Do NOT impute these
+meth[c("idauniq","Gender","dementia")] <- ""
+
+# Continuous
+meth["age_2004"] <- "pmm"
+
+# Ordered categorical
+meth["Education"] <- "polr"
+
+# Binary variables
+meth[c("Marital_status","Employment","Smoking","Alcohol","Physical_activity","Social_activity","frailty")] <- "logreg"
+
+# ==========================================================================
+# 3. Predictor matrix
+pred <- make.predictorMatrix(imp04_elsa)
+
+# Never use ID
+pred[,"idauniq"]<-0; pred["idauniq",]<-0
+
+# ==========================================================================
+# 4. Run MICE
+set.seed(3)
+imp_mice04_elsa <- mice(imp04_elsa, m=20, maxit=10, method=meth, predictorMatrix=pred, printFlag=TRUE)
+
+# ==========================================================================
+# 5. Extract completed dataset and merge back
+imp04_elsa_complete1 <- complete(imp_mice04_elsa, 1)
+
+imputed_vars <- c("Education","Marital_status","Employment","Smoking","Alcohol","Physical_activity","Social_activity","frailty","age_2004")
+elsa04_clean <- elsa_2004 %>% mutate(idauniq=as.character(idauniq)) %>% select(-all_of(imputed_vars)) %>%
+  left_join(imp04_elsa_complete1 %>% mutate(idauniq=as.character(idauniq)) %>% select(idauniq,all_of(imputed_vars)), by="idauniq")
+
+# ==========================================================================
+# 6. Filter by sensory variable availability
+
+# Filter missing hearing loss data
+ELSA_2004 <- elsa04_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+# 9,200
+
+```
+
+
+
+
+
+
+# ELSA Wave 3 (2006)
+```{r}
+elsa_core_w3 <- read_dta(file.path(data_dir, "wave_3_elsa_data_v4.dta"))
+
+# ==========================================================================
+# 1. Covariates
+# W3 notes:
+#   - All variable names are lowercase
+#   - Education: w3edqual (same coding as w2edqual)
+#   - No separate derived file needed for education; w3edqual is in core
+#   - heska (lowercase) instead of HESka
+# ==========================================================================
+
+elsa_cov_2006 <- elsa_core_w3 %>%
+  transmute(
+    idauniq,
+    year = 2006L,
+    birth_year = if_else(indobyr > 0, as.numeric(indobyr), NA_real_),
+    age_2006   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    Gender = case_when(
+      indsex %in% c(1, 2) ~ as.integer(indsex),
+      TRUE                ~ NA_integer_
+    ),
+
+    # w3edqual: same coding as w2edqual
+    Education = case_when(
+      is.na(w3edqual) | w3edqual < 0 ~ NA_integer_,
+      w3edqual == 7                  ~ 0L,
+      w3edqual %in% c(4, 5, 6)      ~ 1L,
+      w3edqual %in% c(1, 2, 3)      ~ 2L,
+      TRUE                          ~ NA_integer_
+    ),
+
+    Marital_status = case_when(
+      dimar %in% c(2, 3)       ~ 1L,
+      dimar %in% c(1, 4, 5, 6) ~ 0L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      wpdes %in% c(2, 3) ~ 1L,
+      wpdes > 0           ~ 0L,
+      TRUE                ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      heska == 1 ~ 1L,
+      heska == 2 ~ 0L,
+      TRUE       ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      scal7a == 1 ~ 1L,
+      scal7a == 2 ~ 0L,
+      TRUE        ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      heacta %in% c(1, 2, 3) ~ 1L,
+      heacta == 4             ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    Social_activity = case_when(
+      scorg01 == 1 | scorg02 == 1 | scorg03 == 1 | scorg04 == 1 |
+      scorg05 == 1 | scorg06 == 1 | scorg07 == 1 | scorg08 == 1 ~ 1L,
+      scorg09 == 1 ~ 0L,
+      scorg01 == 0 & scorg02 == 0 & scorg03 == 0 & scorg04 == 0 &
+      scorg05 == 0 & scorg06 == 0 & scorg07 == 0 & scorg08 == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  select(
+    idauniq, year, birth_year, age_2006,
+    Gender, Education, Marital_status, Employment,
+    Smoking, Alcohol, Physical_activity, Social_activity
+  )
+
+
+# ==========================================================================
+# 2. Sensory variables
+# W3 notes:
+#   - heoptca/heoptgl are in the W3 core file (values 0,1,2,3)
+# ==========================================================================
+
+sensory_var_2006 <- elsa_core_w3 %>%
+  transmute(
+    idauniq,
+
+    hearing_loss = case_when(
+      hehear %in% c(1, 2, 3) ~ 0L,
+      hehear %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    vision_overall = case_when(
+      heeye %in% c(1, 2, 3)    ~ 0L,
+      heeye %in% c(4, 5, 6)    ~ 1L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    # heoptca: 0=never, 1=by W1, 2=by W2, 3=by W3
+    cataract_surgery = case_when(
+      heoptca %in% c(1, 2, 3) ~ 1L,
+      heoptca == 0              ~ 0L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    glaucoma_treatment = case_when(
+      heoptgl %in% c(1, 2, 3) ~ 1L,
+      heoptgl == 0              ~ 0L,
+      TRUE                     ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall,
+         cataract_surgery, glaucoma_treatment)
+
+
+# ==========================================================================
+# 3. Dementia classification
+# W3 notes:
+#   - hedibad/hedibde cumulative: values 1,2,3 = ever reported
+#   - IQCODE items: heiqb-heiqq (lowercase)
+# ==========================================================================
+
+elsa_cog_2006 <- elsa_core_w3 %>%
+  transmute(
+    idauniq,
+    year = 2006L,
+
+    diagnosed_dementia = case_when(
+      hedibad %in% c(1, 2, 3) | hedibde %in% c(1, 2, 3) ~ 1L,
+      hedibad == 0 & hedibde == 0                         ~ 0L,
+      TRUE                                               ~ NA_integer_
+    ),
+
+    iqcode_b = if_else(heiqb %in% 1:5, as.numeric(heiqb), NA_real_),
+    iqcode_c = if_else(heiqc %in% 1:5, as.numeric(heiqc), NA_real_),
+    iqcode_d = if_else(heiqd %in% 1:5, as.numeric(heiqd), NA_real_),
+    iqcode_e = if_else(heiqe %in% 1:5, as.numeric(heiqe), NA_real_),
+    iqcode_f = if_else(heiqf %in% 1:5, as.numeric(heiqf), NA_real_),
+    iqcode_g = if_else(heiqg %in% 1:5, as.numeric(heiqg), NA_real_),
+    iqcode_h = if_else(heiqh %in% 1:5, as.numeric(heiqh), NA_real_),
+    iqcode_i = if_else(heiqi %in% 1:5, as.numeric(heiqi), NA_real_),
+    iqcode_j = if_else(heiqj %in% 1:5, as.numeric(heiqj), NA_real_),
+    iqcode_k = if_else(heiqk %in% 1:5, as.numeric(heiqk), NA_real_),
+    iqcode_l = if_else(heiql %in% 1:5, as.numeric(heiql), NA_real_),
+    iqcode_m = if_else(heiqm %in% 1:5, as.numeric(heiqm), NA_real_),
+    iqcode_n = if_else(heiqn %in% 1:5, as.numeric(heiqn), NA_real_),
+    iqcode_o = if_else(heiqo %in% 1:5, as.numeric(heiqo), NA_real_),
+    iqcode_p = if_else(heiqp %in% 1:5, as.numeric(heiqp), NA_real_),
+    iqcode_q = if_else(heiqq %in% 1:5, as.numeric(heiqq), NA_real_)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    iqcode_n_valid = sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean    = if_else(
+      iqcode_n_valid >= 1,
+      mean(c_across(iqcode_b:iqcode_q), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    iqcode_dementia = case_when(
+      is.na(iqcode_mean)  ~ NA_integer_,
+      iqcode_mean >= 3.4  ~ 1L,
+      iqcode_mean < 3.4   ~ 0L
+    ),
+
+    dementia = case_when(
+      diagnosed_dementia == 1 | iqcode_dementia == 1 ~ 1L,
+      diagnosed_dementia == 0 | iqcode_dementia == 0 ~ 0L,
+      TRUE                                          ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+```
+
+
+
+# Frailty Index 2006
+```{r}
+# 4. Frailty Index (49 items)
+# Wave 3 notes:
+#   - Mobility/ADL already binary (0=Not mentioned, 1=Mentioned)
+#   - headlho instead of headlhg
+#   - hegenh (self-rated health): 1=Very good, 2=Good, 3=Fair, 4=Bad, 5=Very bad
+#     W2 was: 1=Excellent, 2=Very good, 3=Good, 4=Fair, 5=Poor
+#     Recode: 1,2 → 0 (good); 3,4,5 → 1 (deficit)
+#   - Diagnosed conditions: cumulative values 0,1,2,3
+# ==========================================================================
+
+recode_mob_adl <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+recode_dx_w3 <- function(x) {
+  case_when(
+    x %in% c(1, 2, 3) ~ 1L,
+    x == 0             ~ 0L,
+    TRUE               ~ NA_integer_
+  )
+}
+
+# Mobility (Items 1-10)
+mobility_w3 <- elsa_core_w3 %>%
+  select(idauniq, hemobwa, hemobsi, hemobch, hemobcs, hemobcl,
+         hemobst, hemobre, hemobpu, hemobli, hemobpi) %>%
+  mutate(across(-idauniq, recode_mob_adl))
+
+# ADL/IADL (Items 11-23)
+# Note: headlho → rename to headlhg for consistency with W2
+adl_iadl_w3 <- elsa_core_w3 %>%
+  select(idauniq, headldr, headlwa, headlba, headlea, headlbe, headlwc,
+         headlma, headlpr, headlsh, headlph, headlme, headlho, headlmo) %>%
+  rename(headlhg = headlho) %>%
+  mutate(across(-idauniq, recode_mob_adl))
+
+# Diagnosed conditions (Items 24-36)
+diagnoses_w3 <- elsa_core_w3 %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx_w3))
+
+# CES-D (Items 37-44)
+cesd_w3 <- elsa_core_w3 %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd,
+         pscede, pscedf, pscedg, pscedh) %>%
+  mutate(
+    # Standard items: 1(Yes) = deficit
+    psceda = case_when(psceda == 1 ~ 1L, psceda == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(pscedb == 1 ~ 1L, pscedb == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(pscedc == 1 ~ 1L, pscedc == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(pscede == 1 ~ 1L, pscede == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(pscedg == 1 ~ 1L, pscedg == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(pscedh == 1 ~ 1L, pscedh == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: 2(No) = deficit
+    pscedd = case_when(pscedd == 2 ~ 1L, pscedd == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(pscedf == 2 ~ 1L, pscedf == 1 ~ 0L, TRUE ~ NA_integer_)
+  )
+
+# Other health (Items 45, 48-51)
+other_health_w3 <- elsa_core_w3 %>%
+  select(idauniq, hegenh, hefla, hefrac, heji, mmpain) %>%
+  mutate(
+    # W3 hegenh: 1=Very good, 2=Good → 0; 3=Fair, 4=Bad, 5=Very bad → 1
+    hehelf = case_when(
+      hegenh %in% c(1, 2)    ~ 0L,
+      hegenh %in% c(3, 4, 5) ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(hefla  == 1 ~ 1L, hefla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(hefrac == 1 ~ 1L, hefrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(heji   == 1 ~ 1L, heji   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# Merge and compute FI
+elsa_fi_2006 <- mobility_w3 %>%
+  left_join(adl_iadl_w3,     by = "idauniq") %>%
+  left_join(diagnoses_w3,    by = "idauniq") %>%
+  left_join(cesd_w3,         by = "idauniq") %>%
+  left_join(other_health_w3, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2006L,
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+```
+
+
+
+# Merge 2006 data
+```{r}
+# 5. Merge 2006 data
+elsa_2006 <- elsa_cov_2006 %>%
+  left_join(sensory_var_2006, by = "idauniq") %>%
+  left_join(elsa_cog_2006, by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2006, by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+# 6. Multiple imputation
+# ==========================================================================
+imp06_elsa <- elsa_2006 %>% mutate(idauniq=as.character(idauniq)) %>%
+  transmute(idauniq, Gender, age_2006=as.numeric(age_2006), Education=ordered(Education),
+    across(c(Marital_status,Employment,Smoking,Alcohol,Physical_activity,Social_activity,frailty,dementia),~factor(.x,levels=c(0,1)))) %>%
+  mutate(Gender=factor(Gender,levels=c(1,2)))
+
+meth <- make.method(imp06_elsa)
+meth[c("idauniq","Gender","dementia")] <- ""
+meth["age_2006"] <- "pmm"; meth["Education"] <- "polr"
+meth[c("Marital_status","Employment","Smoking","Alcohol","Physical_activity","Social_activity","frailty")] <- "logreg"
+pred <- make.predictorMatrix(imp06_elsa); pred[,"idauniq"]<-0; pred["idauniq",]<-0
+
+set.seed(3)
+imp_mice06_elsa <- mice(imp06_elsa, m=20, maxit=10, method=meth, predictorMatrix=pred, printFlag=TRUE)
+imp06_complete1 <- complete(imp_mice06_elsa, 1)
+
+imputed_vars <- c("Education","Marital_status","Employment","Smoking","Alcohol","Physical_activity","Social_activity","frailty","age_2006")
+elsa06_clean <- elsa_2006 %>% mutate(idauniq=as.character(idauniq)) %>% select(-all_of(imputed_vars)) %>%
+  left_join(imp06_complete1 %>% mutate(idauniq=as.character(idauniq)) %>% select(idauniq,all_of(imputed_vars)), by="idauniq")
+
+# ==========================================================================
+# 7. Filter by sensory variable availability
+ELSA_2006 <- elsa06_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+
+
+# ELSA Wave 4 (2008)
+```{r}
+# W4 notes:
+#   - All variable names lowercase
+#   - Education: w4edqual (same 1-7 coding)
+#   - Marital: dimar coding CHANGED — civil partnership codes added
+#     W2/W3: 1=Single, 2=Married, 3=Remarried, 4=Sep, 5=Div, 6=Widowed
+#     W4:    1=Single, 2=Married, 3=Civil partner, 4=Remarried,
+#            5=Separated, 6=Divorced, 7=Widowed,
+#            8=CP separated, 9=CP dissolved, 10=Surviving CP,
+#            11=CP + previously married
+#   - hehelf back to Excellent scale (like W2, not W3 hegenh)
+#   - heoptca/heoptgl/hedibad/hedibde: binary 0/1 (not cumulative)
+#   - Mobility/ADL: binary (like W3)
+# ==========================================================================
+
+elsa_core_w4 <- read_dta(file.path(data_dir, "wave_4_elsa_data_v3.dta"))
+
+# ==========================================================================
+# 1. Covariates
+# ==========================================================================
+
+elsa_cov_2008 <- elsa_core_w4 %>%
+  transmute(
+    idauniq,
+    year = 2008L,
+    birth_year = if_else(indobyr > 0, as.numeric(indobyr), NA_real_),
+    age_2008   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    Gender = case_when(
+      indsex %in% c(1, 2) ~ as.integer(indsex),
+      TRUE                ~ NA_integer_
+    ),
+
+    Education = case_when(
+      is.na(w4edqual) | w4edqual < 0 ~ NA_integer_,
+      w4edqual == 7                  ~ 0L,
+      w4edqual %in% c(4, 5, 6)      ~ 1L,
+      w4edqual %in% c(1, 2, 3)      ~ 2L,
+      TRUE                          ~ NA_integer_
+    ),
+
+    # W4 dimar: 2=Married, 3=Civil partner, 4=Remarried, 11=CP+married → married
+    #           1=Single, 5=Sep, 6=Div, 7=Widowed, 8-10=CP ended → not married
+    Marital_status = case_when(
+      dimar %in% c(2, 3, 4, 11)              ~ 1L,
+      dimar %in% c(1, 5, 6, 7, 8, 9, 10)     ~ 0L,
+      TRUE                                   ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      wpdes %in% c(2, 3) ~ 1L,
+      wpdes > 0           ~ 0L,
+      TRUE                ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      heska == 1 ~ 1L,
+      heska == 2 ~ 0L,
+      TRUE       ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      scal7a == 1 ~ 1L,
+      scal7a == 2 ~ 0L,
+      TRUE        ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      heacta %in% c(1, 2, 3) ~ 1L,
+      heacta == 4             ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    Social_activity = case_when(
+      scorg01 == 1 | scorg02 == 1 | scorg03 == 1 | scorg04 == 1 |
+      scorg05 == 1 | scorg06 == 1 | scorg07 == 1 | scorg08 == 1 ~ 1L,
+      scorg09 == 1 ~ 0L,
+      scorg01 == 0 & scorg02 == 0 & scorg03 == 0 & scorg04 == 0 &
+      scorg05 == 0 & scorg06 == 0 & scorg07 == 0 & scorg08 == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  select(
+    idauniq, year, birth_year, age_2008,
+    Gender, Education, Marital_status, Employment,
+    Smoking, Alcohol, Physical_activity, Social_activity
+  )
+
+
+# ==========================================================================
+# 2. Sensory variables
+# heoptca/heoptgl: binary 0/1 in W4
+# ==========================================================================
+
+sensory_var_2008 <- elsa_core_w4 %>%
+  transmute(
+    idauniq,
+
+    hearing_loss = case_when(
+      hehear %in% c(1, 2, 3) ~ 0L,
+      hehear %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    vision_overall = case_when(
+      heeye %in% c(1, 2, 3)    ~ 0L,
+      heeye %in% c(4, 5, 6)    ~ 1L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    cataract_surgery = case_when(
+      heoptca == 1 ~ 1L,
+      heoptca == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    ),
+
+    glaucoma_treatment = case_when(
+      heoptgl == 1 ~ 1L,
+      heoptgl == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall,
+         cataract_surgery, glaucoma_treatment)
+
+
+# ==========================================================================
+# 3. Dementia classification
+# hedibad/hedibde: binary 0/1 in W4
+# IQCODE: heiqb-heiqq (lowercase)
+# ==========================================================================
+
+elsa_cog_2008 <- elsa_core_w4 %>%
+  transmute(
+    idauniq,
+    year = 2008L,
+
+    diagnosed_dementia = case_when(
+      hedibad == 1 | hedibde == 1     ~ 1L,
+      hedibad == 0 & hedibde == 0     ~ 0L,
+      TRUE                           ~ NA_integer_
+    ),
+
+    iqcode_b = if_else(heiqb %in% 1:5, as.numeric(heiqb), NA_real_),
+    iqcode_c = if_else(heiqc %in% 1:5, as.numeric(heiqc), NA_real_),
+    iqcode_d = if_else(heiqd %in% 1:5, as.numeric(heiqd), NA_real_),
+    iqcode_e = if_else(heiqe %in% 1:5, as.numeric(heiqe), NA_real_),
+    iqcode_f = if_else(heiqf %in% 1:5, as.numeric(heiqf), NA_real_),
+    iqcode_g = if_else(heiqg %in% 1:5, as.numeric(heiqg), NA_real_),
+    iqcode_h = if_else(heiqh %in% 1:5, as.numeric(heiqh), NA_real_),
+    iqcode_i = if_else(heiqi %in% 1:5, as.numeric(heiqi), NA_real_),
+    iqcode_j = if_else(heiqj %in% 1:5, as.numeric(heiqj), NA_real_),
+    iqcode_k = if_else(heiqk %in% 1:5, as.numeric(heiqk), NA_real_),
+    iqcode_l = if_else(heiql %in% 1:5, as.numeric(heiql), NA_real_),
+    iqcode_m = if_else(heiqm %in% 1:5, as.numeric(heiqm), NA_real_),
+    iqcode_n = if_else(heiqn %in% 1:5, as.numeric(heiqn), NA_real_),
+    iqcode_o = if_else(heiqo %in% 1:5, as.numeric(heiqo), NA_real_),
+    iqcode_p = if_else(heiqp %in% 1:5, as.numeric(heiqp), NA_real_),
+    iqcode_q = if_else(heiqq %in% 1:5, as.numeric(heiqq), NA_real_)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    iqcode_n_valid = sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean    = if_else(
+      iqcode_n_valid >= 1,
+      mean(c_across(iqcode_b:iqcode_q), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    iqcode_dementia = case_when(
+      is.na(iqcode_mean)  ~ NA_integer_,
+      iqcode_mean >= 3.4  ~ 1L,
+      iqcode_mean < 3.4   ~ 0L
+    ),
+
+    dementia = case_when(
+      diagnosed_dementia == 1 | iqcode_dementia == 1 ~ 1L,
+      diagnosed_dementia == 0 | iqcode_dementia == 0 ~ 0L,
+      TRUE                                          ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+```
+
+
+
+# Frailty Index (2008)
+```{r}
+# 4. Frailty Index (49 items)
+# W4 notes:
+#   - Mobility/ADL: binary (0=Not mentioned, 1=Mentioned), same as W3
+#   - headlho → rename to headlhg for consistency
+#   - hehelf: Excellent scale (1=Exc, 2=VG, 3=Good, 4=Fair, 5=Poor)
+#     same as W2 → 1,2,3→0; 4,5→1
+#   - Diagnosed conditions: binary 0/1
+# ==========================================================================
+
+recode_mob_adl_w4 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+recode_dx_w4 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+# Mobility (Items 1-10)
+mobility_w4 <- elsa_core_w4 %>%
+  select(idauniq, hemobwa, hemobsi, hemobch, hemobcs, hemobcl,
+         hemobst, hemobre, hemobpu, hemobli, hemobpi) %>%
+  mutate(across(-idauniq, recode_mob_adl_w4))
+
+# ADL/IADL (Items 11-23)
+# headlho → rename to headlhg for consistency with W2
+adl_iadl_w4 <- elsa_core_w4 %>%
+  select(idauniq, headldr, headlwa, headlba, headlea, headlbe, headlwc,
+         headlma, headlpr, headlsh, headlte, headlme, headlho, headlmo) %>%
+  rename(
+    headlhg = headlho,
+    headlph = headlte
+  ) %>%
+  mutate(across(-idauniq, recode_mob_adl_w4))
+
+# Diagnosed conditions (Items 24-36) — binary 0/1 in W4
+diagnoses_w4 <- elsa_core_w4 %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx_w4))
+
+# CES-D (Items 37-44)
+cesd_w4 <- elsa_core_w4 %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd,
+         pscede, pscedf, pscedg, pscedh) %>%
+  mutate(
+    # Standard items: 1(Yes) = deficit
+    psceda = case_when(psceda == 1 ~ 1L, psceda == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(pscedb == 1 ~ 1L, pscedb == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(pscedc == 1 ~ 1L, pscedc == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(pscede == 1 ~ 1L, pscede == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(pscedg == 1 ~ 1L, pscedg == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(pscedh == 1 ~ 1L, pscedh == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: 2(No) = deficit
+    pscedd = case_when(pscedd == 2 ~ 1L, pscedd == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(pscedf == 2 ~ 1L, pscedf == 1 ~ 0L, TRUE ~ NA_integer_)
+  )
+
+# Other health (Items 45, 48-51)
+# hehelf: Excellent scale (like W2) → 1,2,3→0; 4,5→1
+other_health_w4 <- elsa_core_w4 %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain) %>%
+  mutate(
+    hehelf = case_when(
+      hehelf %in% c(1, 2, 3) ~ 0L,
+      hehelf %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(hefla  == 1 ~ 1L, hefla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(hefrac == 1 ~ 1L, hefrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(heji   == 1 ~ 1L, heji   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# Merge and compute FI
+elsa_fi_2008 <- mobility_w4 %>%
+  left_join(adl_iadl_w4,     by = "idauniq") %>%
+  left_join(diagnoses_w4,    by = "idauniq") %>%
+  left_join(cesd_w4,         by = "idauniq") %>%
+  left_join(other_health_w4, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2008L,
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+
+```
+
+
+
+
+```{r}
+# 5. Merge 2008 data
+# ==========================================================================
+
+elsa_2008 <- elsa_cov_2008 %>%
+  left_join(sensory_var_2008, by = "idauniq") %>%
+  left_join(elsa_cog_2008,    by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2008,     by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+
+# ==========================================================================
+# 6. Multiple imputation
+# ==========================================================================
+
+imp08_elsa <- elsa_2008 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  transmute(
+    idauniq,
+    Gender,
+    age_2008 = as.numeric(age_2008),
+    Education = ordered(Education),
+    across(
+      c(Marital_status, Employment, Smoking, Alcohol,
+        Physical_activity, Social_activity, frailty, dementia),
+      ~ factor(.x, levels = c(0, 1))
+    )
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+meth <- make.method(imp08_elsa)
+meth[c("idauniq", "Gender", "dementia")] <- ""
+meth["age_2008"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity", "frailty")] <- "logreg"
+
+pred <- make.predictorMatrix(imp08_elsa)
+pred[, "idauniq"] <- 0
+pred["idauniq", ] <- 0
+
+set.seed(3)
+imp_mice08_elsa <- mice(
+  imp08_elsa,
+  m      = 20,
+  maxit  = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+imp08_elsa_complete1 <- complete(imp_mice08_elsa, 1)
+
+imputed_vars <- c(
+  "Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+  "Physical_activity", "Social_activity", "frailty", "age_2008"
+)
+
+elsa08_clean <- elsa_2008 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp08_elsa_complete1 %>%
+      mutate(idauniq = as.character(idauniq)) %>%
+      select(idauniq, all_of(imputed_vars)),
+    by = "idauniq"
+  )
+
+
+# ==========================================================================
+# 7. Filter by sensory variable availability
+# ==========================================================================
+
+ELSA_2008 <- elsa08_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+
+
+
+# ELSA Wave 5 (2010)
+```{r}
+# ELSA Wave 5 (2010)
+# W5 notes:
+#   - Same structure as W4
+#   - All variable names lowercase
+#   - Education: w5edqual (same 1-7 coding)
+#   - Marital: dimar with civil partnership codes (same as W4)
+#   - hehelf: Excellent scale (like W2/W4)
+#   - headlte instead of headlph (like W4)
+#   - heoptca/heoptgl/hedibad/hedibde: binary 0/1
+#   - Mobility/ADL: binary
+# ==========================================================================
+
+elsa_core_w5 <- read_dta(file.path(data_dir, "wave_5_elsa_data_v4.dta"))
+
+# ==========================================================================
+# 1. Covariates
+# ==========================================================================
+
+elsa_cov_2010 <- elsa_core_w5 %>%
+  transmute(
+    idauniq,
+    year = 2010L,
+    birth_year = if_else(indobyr > 0, as.numeric(indobyr), NA_real_),
+    age_2010   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    Gender = case_when(
+      indsex %in% c(1, 2) ~ as.integer(indsex),
+      TRUE                ~ NA_integer_
+    ),
+
+    Education = case_when(
+      is.na(w5edqual) | w5edqual < 0 ~ NA_integer_,
+      w5edqual == 7                  ~ 0L,
+      w5edqual %in% c(4, 5, 6)      ~ 1L,
+      w5edqual %in% c(1, 2, 3)      ~ 2L,
+      TRUE                          ~ NA_integer_
+    ),
+
+    # W5 dimar: same civil partnership codes as W4
+    # 2=Married, 3=Civil partner, 4=Remarried, 11=CP+married → married
+    # 1=Single, 5=Sep, 6=Div, 7=Widowed, 8-10=CP ended → not married
+    Marital_status = case_when(
+      dimar %in% c(2, 3, 4, 11)          ~ 1L,
+      dimar %in% c(1, 5, 6, 7, 8, 9, 10) ~ 0L,
+      TRUE                               ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      wpdes %in% c(2, 3) ~ 1L,
+      wpdes > 0           ~ 0L,
+      TRUE                ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      heska == 1 ~ 1L,
+      heska == 2 ~ 0L,
+      TRUE       ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      scal7a == 1 ~ 1L,
+      scal7a == 2 ~ 0L,
+      TRUE        ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      heacta %in% c(1, 2, 3) ~ 1L,
+      heacta == 4             ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    Social_activity = case_when(
+      scorg01 == 1 | scorg02 == 1 | scorg03 == 1 | scorg04 == 1 |
+      scorg05 == 1 | scorg06 == 1 | scorg07 == 1 | scorg08 == 1 ~ 1L,
+      scorg09 == 1 ~ 0L,
+      scorg01 == 0 & scorg02 == 0 & scorg03 == 0 & scorg04 == 0 &
+      scorg05 == 0 & scorg06 == 0 & scorg07 == 0 & scorg08 == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  select(
+    idauniq, year, birth_year, age_2010,
+    Gender, Education, Marital_status, Employment,
+    Smoking, Alcohol, Physical_activity, Social_activity
+  )
+
+
+# ==========================================================================
+# 2. Sensory variables
+# ==========================================================================
+
+sensory_var_2010 <- elsa_core_w5 %>%
+  transmute(
+    idauniq,
+
+    hearing_loss = case_when(
+      hehear %in% c(1, 2, 3) ~ 0L,
+      hehear %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    vision_overall = case_when(
+      heeye %in% c(1, 2, 3)    ~ 0L,
+      heeye %in% c(4, 5, 6)    ~ 1L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    cataract_surgery = case_when(
+      heoptca == 1 ~ 1L,
+      heoptca == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    ),
+
+    glaucoma_treatment = case_when(
+      heoptgl == 1 ~ 1L,
+      heoptgl == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall,
+         cataract_surgery, glaucoma_treatment)
+
+
+# ==========================================================================
+# 3. Dementia classification
+# ==========================================================================
+
+elsa_cog_2010 <- elsa_core_w5 %>%
+  transmute(
+    idauniq,
+    year = 2010L,
+
+    diagnosed_dementia = case_when(
+      hedibad == 1 | hedibde == 1 ~ 1L,
+      hedibad == 0 & hedibde == 0 ~ 0L,
+      TRUE                       ~ NA_integer_
+    ),
+
+    iqcode_b = if_else(heiqb %in% 1:5, as.numeric(heiqb), NA_real_),
+    iqcode_c = if_else(heiqc %in% 1:5, as.numeric(heiqc), NA_real_),
+    iqcode_d = if_else(heiqd %in% 1:5, as.numeric(heiqd), NA_real_),
+    iqcode_e = if_else(heiqe %in% 1:5, as.numeric(heiqe), NA_real_),
+    iqcode_f = if_else(heiqf %in% 1:5, as.numeric(heiqf), NA_real_),
+    iqcode_g = if_else(heiqg %in% 1:5, as.numeric(heiqg), NA_real_),
+    iqcode_h = if_else(heiqh %in% 1:5, as.numeric(heiqh), NA_real_),
+    iqcode_i = if_else(heiqi %in% 1:5, as.numeric(heiqi), NA_real_),
+    iqcode_j = if_else(heiqj %in% 1:5, as.numeric(heiqj), NA_real_),
+    iqcode_k = if_else(heiqk %in% 1:5, as.numeric(heiqk), NA_real_),
+    iqcode_l = if_else(heiql %in% 1:5, as.numeric(heiql), NA_real_),
+    iqcode_m = if_else(heiqm %in% 1:5, as.numeric(heiqm), NA_real_),
+    iqcode_n = if_else(heiqn %in% 1:5, as.numeric(heiqn), NA_real_),
+    iqcode_o = if_else(heiqo %in% 1:5, as.numeric(heiqo), NA_real_),
+    iqcode_p = if_else(heiqp %in% 1:5, as.numeric(heiqp), NA_real_),
+    iqcode_q = if_else(heiqq %in% 1:5, as.numeric(heiqq), NA_real_)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    iqcode_n_valid = sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean    = if_else(
+      iqcode_n_valid >= 1,
+      mean(c_across(iqcode_b:iqcode_q), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    iqcode_dementia = case_when(
+      is.na(iqcode_mean)  ~ NA_integer_,
+      iqcode_mean >= 3.4  ~ 1L,
+      iqcode_mean < 3.4   ~ 0L
+    ),
+
+    dementia = case_when(
+      diagnosed_dementia == 1 | iqcode_dementia == 1 ~ 1L,
+      diagnosed_dementia == 0 | iqcode_dementia == 0 ~ 0L,
+      TRUE                                          ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+```
+
+
+
+# Frailty Index 2010
+```{r}
+# 4. Frailty Index (49 items)
+# W5 notes:
+#   - Same as W4: binary mob/ADL, headlte for phone calls, hehelf Exc scale
+# ==========================================================================
+
+recode_mob_adl_w5 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+recode_dx_w5 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+# Mobility (Items 1-10)
+mobility_w5 <- elsa_core_w5 %>%
+  select(idauniq, hemobwa, hemobsi, hemobch, hemobcs, hemobcl,
+         hemobst, hemobre, hemobpu, hemobli, hemobpi) %>%
+  mutate(across(-idauniq, recode_mob_adl_w5))
+
+# ADL/IADL (Items 11-23)
+# W5: headlte instead of headlph (same as W4)
+# headlho → rename to headlhg for consistency
+adl_iadl_w5 <- elsa_core_w5 %>%
+  select(idauniq, headldr, headlwa, headlba, headlea, headlbe, headlwc,
+         headlma, headlpr, headlsh, headlte, headlme, headlho, headlmo) %>%
+  rename(
+    headlhg = headlho,
+    headlph = headlte
+  ) %>%
+  mutate(across(-idauniq, recode_mob_adl_w5))
+
+# Diagnosed conditions (Items 24-36) — binary 0/1
+diagnoses_w5 <- elsa_core_w5 %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx_w5))
+
+# CES-D (Items 37-44)
+cesd_w5 <- elsa_core_w5 %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd,
+         pscede, pscedf, pscedg, pscedh) %>%
+  mutate(
+    # Standard items: 1(Yes) = deficit
+    psceda = case_when(psceda == 1 ~ 1L, psceda == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(pscedb == 1 ~ 1L, pscedb == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(pscedc == 1 ~ 1L, pscedc == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(pscede == 1 ~ 1L, pscede == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(pscedg == 1 ~ 1L, pscedg == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(pscedh == 1 ~ 1L, pscedh == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: 2(No) = deficit
+    pscedd = case_when(pscedd == 2 ~ 1L, pscedd == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(pscedf == 2 ~ 1L, pscedf == 1 ~ 0L, TRUE ~ NA_integer_)
+  )
+
+# Other health (Items 45, 48-51)
+# hehelf: Excellent scale → 1,2,3→0; 4,5→1
+other_health_w5 <- elsa_core_w5 %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain) %>%
+  mutate(
+    hehelf = case_when(
+      hehelf %in% c(1, 2, 3) ~ 0L,
+      hehelf %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(hefla  == 1 ~ 1L, hefla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(hefrac == 1 ~ 1L, hefrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(heji   == 1 ~ 1L, heji   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# Merge and compute FI
+elsa_fi_2010 <- mobility_w5 %>%
+  left_join(adl_iadl_w5,     by = "idauniq") %>%
+  left_join(diagnoses_w5,    by = "idauniq") %>%
+  left_join(cesd_w5,         by = "idauniq") %>%
+  left_join(other_health_w5, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2010L,
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+```
+
+
+
+# Merge 2010 data
+```{r}
+# 5. Merge 2010 data
+# ==========================================================================
+
+elsa_2010 <- elsa_cov_2010 %>%
+  left_join(sensory_var_2010, by = "idauniq") %>%
+  left_join(elsa_cog_2010,    by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2010,     by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+
+# ==========================================================================
+# 6. Multiple imputation
+# ==========================================================================
+
+imp10_elsa <- elsa_2010 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  transmute(
+    idauniq,
+    Gender,
+    age_2010 = as.numeric(age_2010),
+    Education = ordered(Education),
+    across(
+      c(Marital_status, Employment, Smoking, Alcohol,
+        Physical_activity, Social_activity, frailty, dementia),
+      ~ factor(.x, levels = c(0, 1))
+    )
+  ) %>%
+  mutate(Gender = factor(Gender, levels = c(1, 2)))
+
+meth <- make.method(imp10_elsa)
+meth[c("idauniq", "Gender", "dementia")] <- ""
+meth["age_2010"] <- "pmm"
+meth["Education"] <- "polr"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity", "frailty")] <- "logreg"
+
+pred <- make.predictorMatrix(imp10_elsa)
+pred[, "idauniq"] <- 0
+pred["idauniq", ] <- 0
+
+set.seed(3)
+imp_mice10_elsa <- mice(
+  imp10_elsa,
+  m      = 20,
+  maxit  = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+imp10_elsa_complete1 <- complete(imp_mice10_elsa, 1)
+
+imputed_vars <- c(
+  "Education", "Marital_status", "Employment", "Smoking", "Alcohol",
+  "Physical_activity", "Social_activity", "frailty", "age_2010"
+)
+
+elsa10_clean <- elsa_2010 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  select(-all_of(imputed_vars)) %>%
+  left_join(
+    imp10_elsa_complete1 %>%
+      mutate(idauniq = as.character(idauniq)) %>%
+      select(idauniq, all_of(imputed_vars)),
+    by = "idauniq"
+  )
+
+
+# ==========================================================================
+# 7. Filter by sensory variable availability
+# ==========================================================================
+
+ELSA_2010 <- elsa10_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+
+```
+
+
+
+
+
+
+
+# ELSA Wave 6 (2012)
+```{r}
+# ELSA Wave 6 (2012)
+# W6 notes:
+#   - Mixed case variable names (like W2)
+#   - NO education variable available
+#   - Indobyr (capital I) instead of indobyr
+#   - DiMar with civil partnership codes (same as W4/W5)
+#   - WpDes, HESka, HeActa (mixed case)
+#   - HeHear, HeEye (mixed case)
+#   - PScedA-H (mixed case)
+#   - Hehelf: Excellent scale
+#   - HeFla, HeFrac, HeJi, MmPain (mixed case)
+#   - headlph is back (not headlte like W4/W5)
+#   - Heiqb-Heiqq (mixed case)
+#   - heoptca/heoptgl/hedibad/hedibde: binary 0/1
+# ==========================================================================
+
+elsa_core_w6 <- read_dta(file.path(data_dir, "wave_6_elsa_data_v2.dta"))
+
+# ==========================================================================
+# 1. Covariates
+# ==========================================================================
+
+elsa_cov_2012 <- elsa_core_w6 %>%
+  transmute(
+    idauniq,
+    year = 2012L,
+    birth_year = if_else(Indobyr > 0, as.numeric(Indobyr), NA_real_),
+    age_2012   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    Gender = case_when(
+      indsex %in% c(1, 2) ~ as.integer(indsex),
+      TRUE                ~ NA_integer_
+    ),
+
+    # No education variable in W6
+    Education = NA_integer_,
+
+    # DiMar with civil partnership codes (same as W4/W5)
+    Marital_status = case_when(
+      DiMar %in% c(2, 3, 4, 11)          ~ 1L,
+      DiMar %in% c(1, 5, 6, 7, 8, 9, 10) ~ 0L,
+      TRUE                               ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      WpDes %in% c(2, 3) ~ 1L,
+      WpDes > 0           ~ 0L,
+      TRUE                ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      HESka == 1 ~ 1L,
+      HESka == 2 ~ 0L,
+      TRUE       ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      scal7a == 1 ~ 1L,
+      scal7a == 2 ~ 0L,
+      TRUE        ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      HeActa %in% c(1, 2, 3) ~ 1L,
+      HeActa == 4             ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    Social_activity = case_when(
+      scorg01 == 1 | scorg02 == 1 | scorg03 == 1 | scorg04 == 1 |
+      scorg05 == 1 | scorg06 == 1 | scorg07 == 1 | scorg08 == 1 ~ 1L,
+      scorg09 == 1 ~ 0L,
+      scorg01 == 0 & scorg02 == 0 & scorg03 == 0 & scorg04 == 0 &
+      scorg05 == 0 & scorg06 == 0 & scorg07 == 0 & scorg08 == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  select(
+    idauniq, year, birth_year, age_2012,
+    Gender, Education, Marital_status, Employment,
+    Smoking, Alcohol, Physical_activity, Social_activity
+  )
+
+
+# ==========================================================================
+# 2. Sensory variables
+# ==========================================================================
+
+sensory_var_2012 <- elsa_core_w6 %>%
+  transmute(
+    idauniq,
+
+    hearing_loss = case_when(
+      HeHear %in% c(1, 2, 3) ~ 0L,
+      HeHear %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    vision_overall = case_when(
+      HeEye %in% c(1, 2, 3)    ~ 0L,
+      HeEye %in% c(4, 5, 6)    ~ 1L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    cataract_surgery = case_when(
+      heoptca == 1 ~ 1L,
+      heoptca == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    ),
+
+    glaucoma_treatment = case_when(
+      heoptgl == 1 ~ 1L,
+      heoptgl == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall,
+         cataract_surgery, glaucoma_treatment)
+
+
+# ==========================================================================
+# 3. Dementia classification
+# Heiqb-Heiqq (mixed case)
+# ==========================================================================
+
+elsa_cog_2012 <- elsa_core_w6 %>%
+  transmute(
+    idauniq,
+    year = 2012L,
+
+    diagnosed_dementia = case_when(
+      hedibad == 1 | hedibde == 1 ~ 1L,
+      hedibad == 0 & hedibde == 0 ~ 0L,
+      TRUE                       ~ NA_integer_
+    ),
+
+    iqcode_b = if_else(Heiqb %in% 1:5, as.numeric(Heiqb), NA_real_),
+    iqcode_c = if_else(Heiqc %in% 1:5, as.numeric(Heiqc), NA_real_),
+    iqcode_d = if_else(Heiqd %in% 1:5, as.numeric(Heiqd), NA_real_),
+    iqcode_e = if_else(Heiqe %in% 1:5, as.numeric(Heiqe), NA_real_),
+    iqcode_f = if_else(Heiqf %in% 1:5, as.numeric(Heiqf), NA_real_),
+    iqcode_g = if_else(Heiqg %in% 1:5, as.numeric(Heiqg), NA_real_),
+    iqcode_h = if_else(Heiqh %in% 1:5, as.numeric(Heiqh), NA_real_),
+    iqcode_i = if_else(Heiqi %in% 1:5, as.numeric(Heiqi), NA_real_),
+    iqcode_j = if_else(Heiqj %in% 1:5, as.numeric(Heiqj), NA_real_),
+    iqcode_k = if_else(Heiqk %in% 1:5, as.numeric(Heiqk), NA_real_),
+    iqcode_l = if_else(Heiql %in% 1:5, as.numeric(Heiql), NA_real_),
+    iqcode_m = if_else(Heiqm %in% 1:5, as.numeric(Heiqm), NA_real_),
+    iqcode_n = if_else(Heiqn %in% 1:5, as.numeric(Heiqn), NA_real_),
+    iqcode_o = if_else(Heiqo %in% 1:5, as.numeric(Heiqo), NA_real_),
+    iqcode_p = if_else(Heiqp %in% 1:5, as.numeric(Heiqp), NA_real_),
+    iqcode_q = if_else(Heiqq %in% 1:5, as.numeric(Heiqq), NA_real_)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    iqcode_n_valid = sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean    = if_else(
+      iqcode_n_valid >= 1,
+      mean(c_across(iqcode_b:iqcode_q), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    iqcode_dementia = case_when(
+      is.na(iqcode_mean)  ~ NA_integer_,
+      iqcode_mean >= 3.4  ~ 1L,
+      iqcode_mean < 3.4   ~ 0L
+    ),
+
+    dementia = case_when(
+      diagnosed_dementia == 1 | iqcode_dementia == 1 ~ 1L,
+      diagnosed_dementia == 0 | iqcode_dementia == 0 ~ 0L,
+      TRUE                                          ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+```
+
+
+
+# Frailty Index 2012
+```{r}
+# 4. Frailty Index (49 items)
+# W6 notes:
+#   - Mixed case for mob/ADL binary vars (hemobwa lowercase, but check)
+#   - headlph is back (not headlte like W4/W5)
+#   - headlho → rename to headlhg
+#   - Hehelf: Excellent scale → 1,2,3→0; 4,5→1
+#   - PScedA-H (mixed case)
+#   - HeFla, HeFrac, HeJi, MmPain (mixed case)
+#   - Diagnosed conditions: binary 0/1
+# ==========================================================================
+
+recode_mob_adl_w6 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+recode_dx_w6 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+# Mobility (Items 1-10)
+mobility_w6 <- elsa_core_w6 %>%
+  select(idauniq, hemobwa, hemobsi, hemobch, hemobcs, hemobcl,
+         hemobst, hemobre, hemobpu, hemobli, hemobpi) %>%
+  mutate(across(-idauniq, recode_mob_adl_w6))
+
+# ADL/IADL (Items 11-23)
+# W6: headlph is back (not headlte)
+# headlho → rename to headlhg for consistency
+adl_iadl_w6 <- elsa_core_w6 %>%
+  select(idauniq, headldr, headlwa, headlba, headlea, headlbe, headlwc,
+         headlma, headlpr, headlsh, headlph, headlme, headlho, headlmo) %>%
+  rename(headlhg = headlho) %>%
+  mutate(across(-idauniq, recode_mob_adl_w6))
+
+# Diagnosed conditions (Items 24-36) — binary 0/1
+diagnoses_w6 <- elsa_core_w6 %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx_w6))
+
+# CES-D (Items 37-44) — PScedA-H (mixed case)
+cesd_w6 <- elsa_core_w6 %>%
+  select(idauniq, PScedA, PScedB, PScedC, PScedD,
+         PScedE, PScedF, PScedG, PScedH) %>%
+  mutate(
+    # Standard items: 1(Yes) = deficit
+    psceda = case_when(PScedA == 1 ~ 1L, PScedA == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(PScedB == 1 ~ 1L, PScedB == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(PScedC == 1 ~ 1L, PScedC == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(PScedE == 1 ~ 1L, PScedE == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(PScedG == 1 ~ 1L, PScedG == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(PScedH == 1 ~ 1L, PScedH == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: 2(No) = deficit
+    pscedd = case_when(PScedD == 2 ~ 1L, PScedD == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(PScedF == 2 ~ 1L, PScedF == 1 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd, pscede, pscedf, pscedg, pscedh)
+
+# Other health (Items 45, 48-51) — mixed case
+# Hehelf: Excellent scale → 1,2,3→0; 4,5→1
+other_health_w6 <- elsa_core_w6 %>%
+  select(idauniq, Hehelf, HeFla, HeFrac, HeJi, MmPain) %>%
+  mutate(
+    hehelf = case_when(
+      Hehelf %in% c(1, 2, 3) ~ 0L,
+      Hehelf %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(HeFla  == 1 ~ 1L, HeFla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(HeFrac == 1 ~ 1L, HeFrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(HeJi   == 1 ~ 1L, HeJi   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(MmPain == 1 ~ 1L, MmPain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# Merge and compute FI
+elsa_fi_2012 <- mobility_w6 %>%
+  left_join(adl_iadl_w6,     by = "idauniq") %>%
+  left_join(diagnoses_w6,    by = "idauniq") %>%
+  left_join(cesd_w6,         by = "idauniq") %>%
+  left_join(other_health_w6, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2012L,
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+```
+
+
+
+```{r}
+# 5. Merge 2012 data
+# ==========================================================================
+
+elsa_2012 <- elsa_cov_2012 %>%
+  left_join(sensory_var_2012, by = "idauniq") %>%
+  left_join(elsa_cog_2012,    by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2012,     by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+
+# ==========================================================================
+# 6. Multiple imputation
+# Note: Education is all NA in W6, so exclude from imputation
+# ==========================================================================
+
+imp12_elsa <- elsa_2012 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  transmute(
+    idauniq,
+    Gender,
+    age_2012 = as.numeric(age_2012),
+    Marital_status,
+    Employment,
+    Smoking,
+    Alcohol,
+    Physical_activity,
+    Social_activity,
+    frailty,
+    dementia
+  ) %>%
+  mutate(
+    Gender = factor(Gender, levels = c(1, 2)),
+    across(
+      c(Marital_status, Employment, Smoking, Alcohol,
+        Physical_activity, Social_activity, frailty, dementia),
+      ~ factor(.x, levels = c(0, 1))
+    )
+  )
+
+meth <- make.method(imp12_elsa)
+meth[c("idauniq", "Gender", "dementia")] <- ""
+meth["age_2012"] <- "pmm"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity", "frailty")] <- "logreg"
+
+pred <- make.predictorMatrix(imp12_elsa)
+pred[, "idauniq"] <- 0
+pred["idauniq", ] <- 0
+
+set.seed(3)
+imp_mice12_elsa <- mice(
+  imp12_elsa,
+  m      = 20,
+  maxit  = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+imp12_elsa_complete1 <- complete(imp_mice12_elsa, 1)
+
+imputed_vars_w6 <- c(
+  "Marital_status", "Employment", "Smoking", "Alcohol",
+  "Physical_activity", "Social_activity", "frailty", "age_2012"
+)
+
+elsa12_clean <- elsa_2012 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  select(-all_of(imputed_vars_w6)) %>%
+  left_join(
+    imp12_elsa_complete1 %>%
+      mutate(idauniq = as.character(idauniq)) %>%
+      select(idauniq, all_of(imputed_vars_w6)),
+    by = "idauniq"
+  )
+
+
+# ==========================================================================
+# 7. Final merged dataset
+# ==========================================================================
+
+ELSA_2012 <- elsa12_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+
+
+# ELSA Wave 7 (2014)
+```{r}
+# W7 notes:
+#   - Same structure as W6: mixed case, no education, Indobyr
+#   - DiMar with civil partnership codes
+#   - headlph (same as W6, not headlte like W4/W5)
+#   - Hehelf: Excellent scale
+#   - All diagnosed/heoptca/heoptgl/hedibad/hedibde: binary 0/1
+# ==========================================================================
+
+elsa_core_w7 <- read_dta(file.path(data_dir, "wave_7_elsa_data.dta"))
+
+# ==========================================================================
+# 1. Covariates
+# ==========================================================================
+
+elsa_cov_2014 <- elsa_core_w7 %>%
+  transmute(
+    idauniq,
+    year = 2014L,
+    birth_year = if_else(Indobyr > 0, as.numeric(Indobyr), NA_real_),
+    age_2014   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    Gender = case_when(
+      indsex %in% c(1, 2) ~ as.integer(indsex),
+      TRUE                ~ NA_integer_
+    ),
+
+    # No education variable in W7
+    Education = NA_integer_,
+
+    # DiMar with civil partnership codes (same as W4/W5/W6)
+    Marital_status = case_when(
+      DiMar %in% c(2, 3, 4, 11)          ~ 1L,
+      DiMar %in% c(1, 5, 6, 7, 8, 9, 10) ~ 0L,
+      TRUE                               ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      WpDes %in% c(2, 3) ~ 1L,
+      WpDes > 0           ~ 0L,
+      TRUE                ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      HESka == 1 ~ 1L,
+      HESka == 2 ~ 0L,
+      TRUE       ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      scal7a == 1 ~ 1L,
+      scal7a == 2 ~ 0L,
+      TRUE        ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      HeActa %in% c(1, 2, 3) ~ 1L,
+      HeActa == 4             ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    Social_activity = case_when(
+      scorg01 == 1 | scorg02 == 1 | scorg03 == 1 | scorg04 == 1 |
+      scorg05 == 1 | scorg06 == 1 | scorg07 == 1 | scorg08 == 1 ~ 1L,
+      scorg09 == 1 ~ 0L,
+      scorg01 == 0 & scorg02 == 0 & scorg03 == 0 & scorg04 == 0 &
+      scorg05 == 0 & scorg06 == 0 & scorg07 == 0 & scorg08 == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  select(
+    idauniq, year, birth_year, age_2014,
+    Gender, Education, Marital_status, Employment,
+    Smoking, Alcohol, Physical_activity, Social_activity
+  )
+
+
+# ==========================================================================
+# 2. Sensory variables
+# ==========================================================================
+
+sensory_var_2014 <- elsa_core_w7 %>%
+  transmute(
+    idauniq,
+
+    hearing_loss = case_when(
+      HeHear %in% c(1, 2, 3) ~ 0L,
+      HeHear %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    vision_overall = case_when(
+      HeEye %in% c(1, 2, 3)    ~ 0L,
+      HeEye %in% c(4, 5, 6)    ~ 1L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    cataract_surgery = case_when(
+      heoptca == 1 ~ 1L,
+      heoptca == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    ),
+
+    glaucoma_treatment = case_when(
+      heoptgl == 1 ~ 1L,
+      heoptgl == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall,
+         cataract_surgery, glaucoma_treatment)
+
+
+# ==========================================================================
+# 3. Dementia classification
+# Heiqb-Heiqq (mixed case)
+# ==========================================================================
+
+elsa_cog_2014 <- elsa_core_w7 %>%
+  transmute(
+    idauniq,
+    year = 2014L,
+
+    diagnosed_dementia = case_when(
+      hedibad == 1 | hedibde == 1 ~ 1L,
+      hedibad == 0 & hedibde == 0 ~ 0L,
+      TRUE                       ~ NA_integer_
+    ),
+
+    iqcode_b = if_else(Heiqb %in% 1:5, as.numeric(Heiqb), NA_real_),
+    iqcode_c = if_else(Heiqc %in% 1:5, as.numeric(Heiqc), NA_real_),
+    iqcode_d = if_else(Heiqd %in% 1:5, as.numeric(Heiqd), NA_real_),
+    iqcode_e = if_else(Heiqe %in% 1:5, as.numeric(Heiqe), NA_real_),
+    iqcode_f = if_else(Heiqf %in% 1:5, as.numeric(Heiqf), NA_real_),
+    iqcode_g = if_else(Heiqg %in% 1:5, as.numeric(Heiqg), NA_real_),
+    iqcode_h = if_else(Heiqh %in% 1:5, as.numeric(Heiqh), NA_real_),
+    iqcode_i = if_else(Heiqi %in% 1:5, as.numeric(Heiqi), NA_real_),
+    iqcode_j = if_else(Heiqj %in% 1:5, as.numeric(Heiqj), NA_real_),
+    iqcode_k = if_else(Heiqk %in% 1:5, as.numeric(Heiqk), NA_real_),
+    iqcode_l = if_else(Heiql %in% 1:5, as.numeric(Heiql), NA_real_),
+    iqcode_m = if_else(Heiqm %in% 1:5, as.numeric(Heiqm), NA_real_),
+    iqcode_n = if_else(Heiqn %in% 1:5, as.numeric(Heiqn), NA_real_),
+    iqcode_o = if_else(Heiqo %in% 1:5, as.numeric(Heiqo), NA_real_),
+    iqcode_p = if_else(Heiqp %in% 1:5, as.numeric(Heiqp), NA_real_),
+    iqcode_q = if_else(Heiqq %in% 1:5, as.numeric(Heiqq), NA_real_)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    iqcode_n_valid = sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean    = if_else(
+      iqcode_n_valid >= 1,
+      mean(c_across(iqcode_b:iqcode_q), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    iqcode_dementia = case_when(
+      is.na(iqcode_mean)  ~ NA_integer_,
+      iqcode_mean >= 3.4  ~ 1L,
+      iqcode_mean < 3.4   ~ 0L
+    ),
+
+    dementia = case_when(
+      diagnosed_dementia == 1 | iqcode_dementia == 1 ~ 1L,
+      diagnosed_dementia == 0 | iqcode_dementia == 0 ~ 0L,
+      TRUE                                          ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+```
+
+
+
+
+```{r}
+# 4. Frailty Index (49 items)
+# Same as W6: mixed case, headlph, Hehelf Excellent scale
+# ==========================================================================
+
+recode_mob_adl_w7 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+recode_dx_w7 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+# Mobility (Items 1-10)
+mobility_w7 <- elsa_core_w7 %>%
+  select(idauniq, hemobwa, hemobsi, hemobch, hemobcs, hemobcl,
+         hemobst, hemobre, hemobpu, hemobli, hemobpi) %>%
+  mutate(across(-idauniq, recode_mob_adl_w7))
+
+# ADL/IADL (Items 11-23)
+# W7: headlph (same as W6)
+# headlho → rename to headlhg for consistency
+adl_iadl_w7 <- elsa_core_w7 %>%
+  select(idauniq, headldr, headlwa, headlba, headlea, headlbe, headlwc,
+         headlma, headlpr, headlsh, headlph, headlme, headlho, headlmo) %>%
+  rename(headlhg = headlho) %>%
+  mutate(across(-idauniq, recode_mob_adl_w7))
+
+# Diagnosed conditions (Items 24-36) — binary 0/1
+diagnoses_w7 <- elsa_core_w7 %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx_w7))
+
+# CES-D (Items 37-44) — PScedA-H (mixed case)
+cesd_w7 <- elsa_core_w7 %>%
+  select(idauniq, PScedA, PScedB, PScedC, PScedD,
+         PScedE, PScedF, PScedG, PScedH) %>%
+  mutate(
+    # Standard items: 1(Yes) = deficit
+    psceda = case_when(PScedA == 1 ~ 1L, PScedA == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(PScedB == 1 ~ 1L, PScedB == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(PScedC == 1 ~ 1L, PScedC == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(PScedE == 1 ~ 1L, PScedE == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(PScedG == 1 ~ 1L, PScedG == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(PScedH == 1 ~ 1L, PScedH == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: 2(No) = deficit
+    pscedd = case_when(PScedD == 2 ~ 1L, PScedD == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(PScedF == 2 ~ 1L, PScedF == 1 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd, pscede, pscedf, pscedg, pscedh)
+
+# Other health (Items 45, 48-51) — mixed case
+# Hehelf: Excellent scale → 1,2,3→0; 4,5→1
+other_health_w7 <- elsa_core_w7 %>%
+  select(idauniq, Hehelf, HeFla, HeFrac, HeJi, MmPain) %>%
+  mutate(
+    hehelf = case_when(
+      Hehelf %in% c(1, 2, 3) ~ 0L,
+      Hehelf %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(HeFla  == 1 ~ 1L, HeFla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(HeFrac == 1 ~ 1L, HeFrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(HeJi   == 1 ~ 1L, HeJi   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(MmPain == 1 ~ 1L, MmPain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# Merge and compute FI
+elsa_fi_2014 <- mobility_w7 %>%
+  left_join(adl_iadl_w7,     by = "idauniq") %>%
+  left_join(diagnoses_w7,    by = "idauniq") %>%
+  left_join(cesd_w7,         by = "idauniq") %>%
+  left_join(other_health_w7, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2014L,
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+
+```
+
+
+
+```{r}
+# 5. Merge 2014 data
+# ==========================================================================
+
+elsa_2014 <- elsa_cov_2014 %>%
+  left_join(sensory_var_2014, by = "idauniq") %>%
+  left_join(elsa_cog_2014,    by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2014,     by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+
+# ==========================================================================
+# 6. Multiple imputation
+# Note: Education is all NA in W7, so exclude from imputation (same as W6)
+# ==========================================================================
+
+imp14_elsa <- elsa_2014 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  transmute(
+    idauniq,
+    Gender,
+    age_2014 = as.numeric(age_2014),
+    Marital_status,
+    Employment,
+    Smoking,
+    Alcohol,
+    Physical_activity,
+    Social_activity,
+    frailty,
+    dementia
+  ) %>%
+  mutate(
+    Gender = factor(Gender, levels = c(1, 2)),
+    across(
+      c(Marital_status, Employment, Smoking, Alcohol,
+        Physical_activity, Social_activity, frailty, dementia),
+      ~ factor(.x, levels = c(0, 1))
+    )
+  )
+
+meth <- make.method(imp14_elsa)
+meth[c("idauniq", "Gender", "dementia")] <- ""
+meth["age_2014"] <- "pmm"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity", "frailty")] <- "logreg"
+
+pred <- make.predictorMatrix(imp14_elsa)
+pred[, "idauniq"] <- 0
+pred["idauniq", ] <- 0
+
+set.seed(3)
+imp_mice14_elsa <- mice(
+  imp14_elsa,
+  m      = 20,
+  maxit  = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+imp14_elsa_complete1 <- complete(imp_mice14_elsa, 1)
+
+imputed_vars_w7 <- c(
+  "Marital_status", "Employment", "Smoking", "Alcohol",
+  "Physical_activity", "Social_activity", "frailty", "age_2014"
+)
+
+elsa14_clean <- elsa_2014 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  select(-all_of(imputed_vars_w7)) %>%
+  left_join(
+    imp14_elsa_complete1 %>%
+      mutate(idauniq = as.character(idauniq)) %>%
+      select(idauniq, all_of(imputed_vars_w7)),
+    by = "idauniq"
+  )
+
+
+# ==========================================================================
+# 7. Final merged dataset
+# ==========================================================================
+
+ELSA_2014 <- elsa14_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+
+
+# ELSA Wave 8 (2016)
+```{r}
+# ELSA Wave 8 (2016)
+# W8 notes:
+#   - All lowercase variable names
+#   - NO education variable
+#   - Marital: dimarr (not dimar/DiMar) — simplified coding:
+#     1=Single, 2=Married or CP (combined), 3=Remarried,
+#     4=Separated/CP separated, 5=Divorced/CP dissolved,
+#     6=Widowed/surviving CP
+#   - Social: NEW variable names (scorgpo, scorgnw, scorgrl, scorgch,
+#     scorged, scorgsc, scorgsp, scorg95, scorg96)
+#   - headlph present (not headlte)
+#   - IQCODE: lowercase heiqb-q
+#   - All binary 0/1
+# ==========================================================================
+
+elsa_core_w8 <- read_dta(file.path(data_dir, "wave_8_elsa_data_eul_v2.dta"))
+
+# ==========================================================================
+# 1. Covariates
+# ==========================================================================
+
+elsa_cov_2016 <- elsa_core_w8 %>%
+  transmute(
+    idauniq,
+    year = 2016L,
+    birth_year = if_else(indobyr > 0, as.numeric(indobyr), NA_real_),
+    age_2016   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    Gender = case_when(
+      indsex %in% c(1, 2) ~ as.integer(indsex),
+      TRUE                ~ NA_integer_
+    ),
+
+    # No education variable in W8
+    Education = NA_integer_,
+
+    # dimarr: simplified coding
+    # 2=Married/CP, 3=Remarried → married (1)
+    # 1=Single, 4=Separated, 5=Divorced, 6=Widowed → not married (0)
+    Marital_status = case_when(
+      dimarr %in% c(2, 3)       ~ 1L,
+      dimarr %in% c(1, 4, 5, 6) ~ 0L,
+      TRUE                      ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      wpdes %in% c(2, 3) ~ 1L,
+      wpdes > 0           ~ 0L,
+      TRUE                ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      heska == 1 ~ 1L,
+      heska == 2 ~ 0L,
+      TRUE       ~ NA_integer_
+    ),
+
+    Alcohol = case_when(
+      scal7a == 1 ~ 1L,
+      scal7a == 2 ~ 0L,
+      TRUE        ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      heacta %in% c(1, 2, 3) ~ 1L,
+      heacta == 4             ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    # W8 social: new variable names
+    # scorgpo=political, scorgnw=neighbourhood, scorgrl=religious,
+    # scorgch=charitable, scorged=education, scorgsc=social club,
+    # scorgsp=sports, scorg95=other, scorg96=none
+    Social_activity = case_when(
+      scorgpo == 1 | scorgnw == 1 | scorgrl == 1 | scorgch == 1 |
+      scorged == 1 | scorgsc == 1 | scorgsp == 1 | scorg95 == 1 ~ 1L,
+      scorg96 == 1 ~ 0L,
+      scorgpo == 0 & scorgnw == 0 & scorgrl == 0 & scorgch == 0 &
+      scorged == 0 & scorgsc == 0 & scorgsp == 0 & scorg95 == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  select(
+    idauniq, year, birth_year, age_2016,
+    Gender, Education, Marital_status, Employment,
+    Smoking, Alcohol, Physical_activity, Social_activity
+  )
+
+
+# ==========================================================================
+# 2. Sensory variables
+# ==========================================================================
+
+sensory_var_2016 <- elsa_core_w8 %>%
+  transmute(
+    idauniq,
+
+    hearing_loss = case_when(
+      hehear %in% c(1, 2, 3) ~ 0L,
+      hehear %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    vision_overall = case_when(
+      heeye %in% c(1, 2, 3)    ~ 0L,
+      heeye %in% c(4, 5, 6)    ~ 1L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    cataract_surgery = case_when(
+      heoptca == 1 ~ 1L,
+      heoptca == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    ),
+
+    glaucoma_treatment = case_when(
+      heoptgl == 1 ~ 1L,
+      heoptgl == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall,
+         cataract_surgery, glaucoma_treatment)
+
+
+# ==========================================================================
+# 3. Dementia classification
+# lowercase heiqb-q
+# ==========================================================================
+
+elsa_cog_2016 <- elsa_core_w8 %>%
+  transmute(
+    idauniq,
+    year = 2016L,
+
+    diagnosed_dementia = case_when(
+      hedibad == 1 | hedibde == 1 ~ 1L,
+      hedibad == 0 & hedibde == 0 ~ 0L,
+      TRUE                       ~ NA_integer_
+    ),
+
+    iqcode_b = if_else(heiqb %in% 1:5, as.numeric(heiqb), NA_real_),
+    iqcode_c = if_else(heiqc %in% 1:5, as.numeric(heiqc), NA_real_),
+    iqcode_d = if_else(heiqd %in% 1:5, as.numeric(heiqd), NA_real_),
+    iqcode_e = if_else(heiqe %in% 1:5, as.numeric(heiqe), NA_real_),
+    iqcode_f = if_else(heiqf %in% 1:5, as.numeric(heiqf), NA_real_),
+    iqcode_g = if_else(heiqg %in% 1:5, as.numeric(heiqg), NA_real_),
+    iqcode_h = if_else(heiqh %in% 1:5, as.numeric(heiqh), NA_real_),
+    iqcode_i = if_else(heiqi %in% 1:5, as.numeric(heiqi), NA_real_),
+    iqcode_j = if_else(heiqj %in% 1:5, as.numeric(heiqj), NA_real_),
+    iqcode_k = if_else(heiqk %in% 1:5, as.numeric(heiqk), NA_real_),
+    iqcode_l = if_else(heiql %in% 1:5, as.numeric(heiql), NA_real_),
+    iqcode_m = if_else(heiqm %in% 1:5, as.numeric(heiqm), NA_real_),
+    iqcode_n = if_else(heiqn %in% 1:5, as.numeric(heiqn), NA_real_),
+    iqcode_o = if_else(heiqo %in% 1:5, as.numeric(heiqo), NA_real_),
+    iqcode_p = if_else(heiqp %in% 1:5, as.numeric(heiqp), NA_real_),
+    iqcode_q = if_else(heiqq %in% 1:5, as.numeric(heiqq), NA_real_)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    iqcode_n_valid = sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean    = if_else(
+      iqcode_n_valid >= 1,
+      mean(c_across(iqcode_b:iqcode_q), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    iqcode_dementia = case_when(
+      is.na(iqcode_mean)  ~ NA_integer_,
+      iqcode_mean >= 3.4  ~ 1L,
+      iqcode_mean < 3.4   ~ 0L
+    ),
+
+    dementia = case_when(
+      diagnosed_dementia == 1 | iqcode_dementia == 1 ~ 1L,
+      diagnosed_dementia == 0 | iqcode_dementia == 0 ~ 0L,
+      TRUE                                          ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+```
+
+
+
+
+```{r}
+# 4. Frailty Index (49 items)
+# W8: lowercase, headlph present, hehelf Excellent scale, binary 0/1
+# ==========================================================================
+
+recode_mob_adl_w8 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+recode_dx_w8 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+# Mobility (Items 1-10)
+mobility_w8 <- elsa_core_w8 %>%
+  select(idauniq, hemobwa, hemobsi, hemobch, hemobcs, hemobcl,
+         hemobst, hemobre, hemobpu, hemobli, hemobpi) %>%
+  mutate(across(-idauniq, recode_mob_adl_w8))
+
+# ADL/IADL (Items 11-23)
+# W8: headlph present, headlho → headlhg
+adl_iadl_w8 <- elsa_core_w8 %>%
+  select(idauniq, headldr, headlwa, headlba, headlea, headlbe, headlwc,
+         headlma, headlpr, headlsh, headlph, headlme, headlho, headlmo) %>%
+  rename(headlhg = headlho) %>%
+  mutate(across(-idauniq, recode_mob_adl_w8))
+
+# Diagnosed conditions (Items 24-36) — binary 0/1
+diagnoses_w8 <- elsa_core_w8 %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx_w8))
+
+# CES-D (Items 37-44) — lowercase
+cesd_w8 <- elsa_core_w8 %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd,
+         pscede, pscedf, pscedg, pscedh) %>%
+  mutate(
+    # Standard items: 1(Yes) = deficit
+    psceda = case_when(psceda == 1 ~ 1L, psceda == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(pscedb == 1 ~ 1L, pscedb == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(pscedc == 1 ~ 1L, pscedc == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(pscede == 1 ~ 1L, pscede == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(pscedg == 1 ~ 1L, pscedg == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(pscedh == 1 ~ 1L, pscedh == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: 2(No) = deficit
+    pscedd = case_when(pscedd == 2 ~ 1L, pscedd == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(pscedf == 2 ~ 1L, pscedf == 1 ~ 0L, TRUE ~ NA_integer_)
+  )
+
+# Other health (Items 45, 48-51)
+# hehelf: Excellent scale → 1,2,3→0; 4,5→1
+other_health_w8 <- elsa_core_w8 %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain) %>%
+  mutate(
+    hehelf = case_when(
+      hehelf %in% c(1, 2, 3) ~ 0L,
+      hehelf %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(hefla  == 1 ~ 1L, hefla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(hefrac == 1 ~ 1L, hefrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(heji   == 1 ~ 1L, heji   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# Merge and compute FI
+elsa_fi_2016 <- mobility_w8 %>%
+  left_join(adl_iadl_w8,     by = "idauniq") %>%
+  left_join(diagnoses_w8,    by = "idauniq") %>%
+  left_join(cesd_w8,         by = "idauniq") %>%
+  left_join(other_health_w8, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2016L,
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+```
+
+
+
+
+```{r}
+# 5. Merge 2016 data
+# ==========================================================================
+
+elsa_2016 <- elsa_cov_2016 %>%
+  left_join(sensory_var_2016, by = "idauniq") %>%
+  left_join(elsa_cog_2016,    by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2016,     by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+
+# ==========================================================================
+# 6. Multiple imputation
+# Note: No Education in W8, exclude from imputation
+# ==========================================================================
+
+imp16_elsa <- elsa_2016 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  transmute(
+    idauniq,
+    Gender,
+    age_2016 = as.numeric(age_2016),
+    Marital_status,
+    Employment,
+    Smoking,
+    Alcohol,
+    Physical_activity,
+    Social_activity,
+    frailty,
+    dementia
+  ) %>%
+  mutate(
+    Gender = factor(Gender, levels = c(1, 2)),
+    across(
+      c(Marital_status, Employment, Smoking, Alcohol,
+        Physical_activity, Social_activity, frailty, dementia),
+      ~ factor(.x, levels = c(0, 1))
+    )
+  )
+
+meth <- make.method(imp16_elsa)
+meth[c("idauniq", "Gender", "dementia")] <- ""
+meth["age_2016"] <- "pmm"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity", "frailty")] <- "logreg"
+
+pred <- make.predictorMatrix(imp16_elsa)
+pred[, "idauniq"] <- 0
+pred["idauniq", ] <- 0
+
+set.seed(3)
+imp_mice16_elsa <- mice(
+  imp16_elsa,
+  m      = 20,
+  maxit  = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+imp16_elsa_complete1 <- complete(imp_mice16_elsa, 1)
+
+imputed_vars_w8 <- c(
+  "Marital_status", "Employment", "Smoking", "Alcohol",
+  "Physical_activity", "Social_activity", "frailty", "age_2016"
+)
+
+elsa16_clean <- elsa_2016 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  select(-all_of(imputed_vars_w8)) %>%
+  left_join(
+    imp16_elsa_complete1 %>%
+      mutate(idauniq = as.character(idauniq)) %>%
+      select(idauniq, all_of(imputed_vars_w8)),
+    by = "idauniq"
+  )
+
+
+# ==========================================================================
+# 7. Final merged dataset
+# ==========================================================================
+
+ELSA_2016 <- elsa16_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+
+
+# ELSA Wave 9 (2018)
+```{r}
+# ELSA Wave 9 (2018)
+# W9 notes:
+#   - Same structure as W8: all lowercase, no education, dimarr
+#   - Alcohol: scal7a GONE → scalcy (same 1=Yes/2=No coding)
+#   - Social: same new names as W8 (scorgpo, scorgnw, etc.)
+#   - Everything else identical to W8
+# ==========================================================================
+
+elsa_core_w9 <- read_dta(file.path(data_dir, "wave_9_elsa_data_eul_v2.dta"))
+
+# ==========================================================================
+# 1. Covariates
+# ==========================================================================
+
+elsa_cov_2018 <- elsa_core_w9 %>%
+  transmute(
+    idauniq,
+    year = 2018L,
+    birth_year = if_else(indobyr > 0, as.numeric(indobyr), NA_real_),
+    age_2018   = if_else(indager > 0, as.numeric(indager), NA_real_),
+
+    Gender = case_when(
+      indsex %in% c(1, 2) ~ as.integer(indsex),
+      TRUE                ~ NA_integer_
+    ),
+
+    # No education variable in W9
+    Education = NA_integer_,
+
+    # dimarr: simplified coding (same as W8)
+    # 2=Married/CP, 3=Remarried → married (1)
+    # 1=Single, 4=Separated, 5=Divorced, 6=Widowed → not married (0)
+    Marital_status = case_when(
+      dimarr %in% c(2, 3)       ~ 1L,
+      dimarr %in% c(1, 4, 5, 6) ~ 0L,
+      TRUE                      ~ NA_integer_
+    ),
+
+    Employment = case_when(
+      wpdes %in% c(2, 3) ~ 1L,
+      wpdes > 0           ~ 0L,
+      TRUE                ~ NA_integer_
+    ),
+
+    Smoking = case_when(
+      heska == 1 ~ 1L,
+      heska == 2 ~ 0L,
+      TRUE       ~ NA_integer_
+    ),
+
+    # W9: scalcy replaces scal7a (same 1=Yes/2=No coding)
+    Alcohol = case_when(
+      scalcy == 1 ~ 1L,
+      scalcy == 2 ~ 0L,
+      TRUE        ~ NA_integer_
+    ),
+
+    Physical_activity = case_when(
+      heacta %in% c(1, 2, 3) ~ 1L,
+      heacta == 4             ~ 0L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    # W9 social: same new names as W8
+    Social_activity = case_when(
+      scorgpo == 1 | scorgnw == 1 | scorgrl == 1 | scorgch == 1 |
+      scorged == 1 | scorgsc == 1 | scorgsp == 1 | scorg95 == 1 ~ 1L,
+      scorg96 == 1 ~ 0L,
+      scorgpo == 0 & scorgnw == 0 & scorgrl == 0 & scorgch == 0 &
+      scorged == 0 & scorgsc == 0 & scorgsp == 0 & scorg95 == 0 ~ 0L,
+      TRUE ~ NA_integer_
+    )
+  ) %>%
+  select(
+    idauniq, year, birth_year, age_2018,
+    Gender, Education, Marital_status, Employment,
+    Smoking, Alcohol, Physical_activity, Social_activity
+  )
+
+
+# ==========================================================================
+# 2. Sensory variables
+# ==========================================================================
+
+sensory_var_2018 <- elsa_core_w9 %>%
+  transmute(
+    idauniq,
+
+    hearing_loss = case_when(
+      hehear %in% c(1, 2, 3) ~ 0L,
+      hehear %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+
+    vision_overall = case_when(
+      heeye %in% c(1, 2, 3)    ~ 0L,
+      heeye %in% c(4, 5, 6)    ~ 1L,
+      TRUE                     ~ NA_integer_
+    ),
+
+    cataract_surgery = case_when(
+      heoptca == 1 ~ 1L,
+      heoptca == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    ),
+
+    glaucoma_treatment = case_when(
+      heoptgl == 1 ~ 1L,
+      heoptgl == 0 ~ 0L,
+      TRUE         ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, hearing_loss, vision_overall,
+         cataract_surgery, glaucoma_treatment)
+
+
+# ==========================================================================
+# 3. Dementia classification
+# ==========================================================================
+
+elsa_cog_2018 <- elsa_core_w9 %>%
+  transmute(
+    idauniq,
+    year = 2018L,
+
+    diagnosed_dementia = case_when(
+      hedibad == 1 | hedibde == 1 ~ 1L,
+      hedibad == 0 & hedibde == 0 ~ 0L,
+      TRUE                       ~ NA_integer_
+    ),
+
+    iqcode_b = if_else(heiqb %in% 1:5, as.numeric(heiqb), NA_real_),
+    iqcode_c = if_else(heiqc %in% 1:5, as.numeric(heiqc), NA_real_),
+    iqcode_d = if_else(heiqd %in% 1:5, as.numeric(heiqd), NA_real_),
+    iqcode_e = if_else(heiqe %in% 1:5, as.numeric(heiqe), NA_real_),
+    iqcode_f = if_else(heiqf %in% 1:5, as.numeric(heiqf), NA_real_),
+    iqcode_g = if_else(heiqg %in% 1:5, as.numeric(heiqg), NA_real_),
+    iqcode_h = if_else(heiqh %in% 1:5, as.numeric(heiqh), NA_real_),
+    iqcode_i = if_else(heiqi %in% 1:5, as.numeric(heiqi), NA_real_),
+    iqcode_j = if_else(heiqj %in% 1:5, as.numeric(heiqj), NA_real_),
+    iqcode_k = if_else(heiqk %in% 1:5, as.numeric(heiqk), NA_real_),
+    iqcode_l = if_else(heiql %in% 1:5, as.numeric(heiql), NA_real_),
+    iqcode_m = if_else(heiqm %in% 1:5, as.numeric(heiqm), NA_real_),
+    iqcode_n = if_else(heiqn %in% 1:5, as.numeric(heiqn), NA_real_),
+    iqcode_o = if_else(heiqo %in% 1:5, as.numeric(heiqo), NA_real_),
+    iqcode_p = if_else(heiqp %in% 1:5, as.numeric(heiqp), NA_real_),
+    iqcode_q = if_else(heiqq %in% 1:5, as.numeric(heiqq), NA_real_)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    iqcode_n_valid = sum(!is.na(c_across(iqcode_b:iqcode_q))),
+    iqcode_mean    = if_else(
+      iqcode_n_valid >= 1,
+      mean(c_across(iqcode_b:iqcode_q), na.rm = TRUE),
+      NA_real_
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    iqcode_dementia = case_when(
+      is.na(iqcode_mean)  ~ NA_integer_,
+      iqcode_mean >= 3.4  ~ 1L,
+      iqcode_mean < 3.4   ~ 0L
+    ),
+
+    dementia = case_when(
+      diagnosed_dementia == 1 | iqcode_dementia == 1 ~ 1L,
+      diagnosed_dementia == 0 | iqcode_dementia == 0 ~ 0L,
+      TRUE                                          ~ NA_integer_
+    )
+  ) %>%
+  select(idauniq, year, diagnosed_dementia, iqcode_mean, iqcode_dementia, dementia)
+
+
+```
+
+
+# Frailty Index 2018-2019
+```{r}
+# 4. Frailty Index (49 items)
+# Same as W8: lowercase, headlph, hehelf Excellent scale, binary 0/1
+# ==========================================================================
+
+recode_mob_adl_w9 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+recode_dx_w9 <- function(x) {
+  case_when(
+    x == 1  ~ 1L,
+    x == 0  ~ 0L,
+    TRUE    ~ NA_integer_
+  )
+}
+
+# Mobility (Items 1-10)
+mobility_w9 <- elsa_core_w9 %>%
+  select(idauniq, hemobwa, hemobsi, hemobch, hemobcs, hemobcl,
+         hemobst, hemobre, hemobpu, hemobli, hemobpi) %>%
+  mutate(across(-idauniq, recode_mob_adl_w9))
+
+# ADL/IADL (Items 11-23)
+# headlph present, headlho → headlhg
+adl_iadl_w9 <- elsa_core_w9 %>%
+  select(idauniq, headldr, headlwa, headlba, headlea, headlbe, headlwc,
+         headlma, headlpr, headlsh, headlph, headlme, headlho, headlmo) %>%
+  rename(headlhg = headlho) %>%
+  mutate(across(-idauniq, recode_mob_adl_w9))
+
+# Diagnosed conditions (Items 24-36) — binary 0/1
+diagnoses_w9 <- elsa_core_w9 %>%
+  select(idauniq, hedimbp, hediman, hedimmi, hedimhf, hedimar,
+         hedimdi, hedimst, hediblu, hedibas, hedibar, hedibos,
+         hedibca, hedibps) %>%
+  mutate(across(-idauniq, recode_dx_w9))
+
+# CES-D (Items 37-44) — lowercase
+cesd_w9 <- elsa_core_w9 %>%
+  select(idauniq, psceda, pscedb, pscedc, pscedd,
+         pscede, pscedf, pscedg, pscedh) %>%
+  mutate(
+    # Standard items: 1(Yes) = deficit
+    psceda = case_when(psceda == 1 ~ 1L, psceda == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedb = case_when(pscedb == 1 ~ 1L, pscedb == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedc = case_when(pscedc == 1 ~ 1L, pscedc == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscede = case_when(pscede == 1 ~ 1L, pscede == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedg = case_when(pscedg == 1 ~ 1L, pscedg == 2 ~ 0L, TRUE ~ NA_integer_),
+    pscedh = case_when(pscedh == 1 ~ 1L, pscedh == 2 ~ 0L, TRUE ~ NA_integer_),
+    # Reverse-coded: 2(No) = deficit
+    pscedd = case_when(pscedd == 2 ~ 1L, pscedd == 1 ~ 0L, TRUE ~ NA_integer_),
+    pscedf = case_when(pscedf == 2 ~ 1L, pscedf == 1 ~ 0L, TRUE ~ NA_integer_)
+  )
+
+# Other health (Items 45, 48-51)
+# hehelf: Excellent scale → 1,2,3→0; 4,5→1
+other_health_w9 <- elsa_core_w9 %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain) %>%
+  mutate(
+    hehelf = case_when(
+      hehelf %in% c(1, 2, 3) ~ 0L,
+      hehelf %in% c(4, 5)    ~ 1L,
+      TRUE                   ~ NA_integer_
+    ),
+    hefla  = case_when(hefla  == 1 ~ 1L, hefla  == 2 ~ 0L, TRUE ~ NA_integer_),
+    hefrac = case_when(hefrac == 1 ~ 1L, hefrac == 2 ~ 0L, TRUE ~ NA_integer_),
+    heji   = case_when(heji   == 1 ~ 1L, heji   == 2 ~ 0L, TRUE ~ NA_integer_),
+    mmpain = case_when(mmpain == 1 ~ 1L, mmpain == 2 ~ 0L, TRUE ~ NA_integer_)
+  ) %>%
+  select(idauniq, hehelf, hefla, hefrac, heji, mmpain)
+
+# Merge and compute FI
+elsa_fi_2018 <- mobility_w9 %>%
+  left_join(adl_iadl_w9,     by = "idauniq") %>%
+  left_join(diagnoses_w9,    by = "idauniq") %>%
+  left_join(cesd_w9,         by = "idauniq") %>%
+  left_join(other_health_w9, by = "idauniq") %>%
+  rowwise() %>%
+  mutate(
+    fi_n_valid   = sum(!is.na(c_across(all_of(fi_items)))),
+    fi_n_deficit = sum(c_across(all_of(fi_items)) == 1, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    year = 2018L,
+    fi_score = if_else(
+      fi_n_valid >= ceiling(n_fi_items * 0.8),
+      fi_n_deficit / fi_n_valid,
+      NA_real_
+    ),
+    frailty = case_when(
+      is.na(fi_score)   ~ NA_integer_,
+      fi_score >= 0.25  ~ 1L,
+      fi_score < 0.25   ~ 0L
+    )
+  ) %>%
+  filter(!is.na(fi_score)) %>%
+  select(idauniq, year, fi_n_valid, fi_n_deficit, fi_score, frailty)
+
+
+```
+
+
+
+
+```{r}
+# 5. Merge 2018 data
+# ==========================================================================
+
+elsa_2018 <- elsa_cov_2018 %>%
+  left_join(sensory_var_2018, by = "idauniq") %>%
+  left_join(elsa_cog_2018,    by = c("idauniq", "year")) %>%
+  left_join(elsa_fi_2018,     by = c("idauniq", "year")) %>%
+  filter(!is.na(dementia), !is.na(frailty))
+
+
+# ==========================================================================
+# 6. Multiple imputation
+# Note: No Education in W9, exclude from imputation
+# ==========================================================================
+
+imp18_elsa <- elsa_2018 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  transmute(
+    idauniq,
+    Gender,
+    age_2018 = as.numeric(age_2018),
+    Marital_status,
+    Employment,
+    Smoking,
+    Alcohol,
+    Physical_activity,
+    Social_activity,
+    frailty,
+    dementia
+  ) %>%
+  mutate(
+    Gender = factor(Gender, levels = c(1, 2)),
+    across(
+      c(Marital_status, Employment, Smoking, Alcohol,
+        Physical_activity, Social_activity, frailty, dementia),
+      ~ factor(.x, levels = c(0, 1))
+    )
+  )
+
+meth <- make.method(imp18_elsa)
+meth[c("idauniq", "Gender", "dementia")] <- ""
+meth["age_2018"] <- "pmm"
+meth[c("Marital_status", "Employment", "Smoking", "Alcohol",
+       "Physical_activity", "Social_activity", "frailty")] <- "logreg"
+
+pred <- make.predictorMatrix(imp18_elsa)
+pred[, "idauniq"] <- 0
+pred["idauniq", ] <- 0
+
+set.seed(3)
+imp_mice18_elsa <- mice(
+  imp18_elsa,
+  m      = 20,
+  maxit  = 10,
+  method = meth,
+  predictorMatrix = pred,
+  printFlag = TRUE
+)
+
+imp18_elsa_complete1 <- complete(imp_mice18_elsa, 1)
+
+imputed_vars_w9 <- c(
+  "Marital_status", "Employment", "Smoking", "Alcohol",
+  "Physical_activity", "Social_activity", "frailty", "age_2018"
+)
+
+elsa18_clean <- elsa_2018 %>%
+  mutate(idauniq = as.character(idauniq)) %>%
+  select(-all_of(imputed_vars_w9)) %>%
+  left_join(
+    imp18_elsa_complete1 %>%
+      mutate(idauniq = as.character(idauniq)) %>%
+      select(idauniq, all_of(imputed_vars_w9)),
+    by = "idauniq"
+  )
+
+
+# ==========================================================================
+# 7. Final merged dataset
+# ==========================================================================
+
+ELSA_2018 <- elsa18_clean %>%
+  filter(
+    !is.na(hearing_loss),
+    !is.na(vision_overall),
+    !(is.na(cataract_surgery) & is.na(glaucoma_treatment))
+  ) %>%
+  mutate(
+    impaired_vision = pmax(
+      coalesce(cataract_surgery, 0L),
+      coalesce(glaucoma_treatment, 0L)
+    )
+  )
+
+```
+
+
+
+
+```{r}
+# Merge all waves into longitudinal datasets
+# Put wave datasets into a list
+dat_list <- list(
+  elsa04 = ELSA_2004 %>% mutate(Education = as.integer(Education)),
+  elsa06 = ELSA_2006 %>% mutate(Education = as.integer(Education)),
+  elsa08 = ELSA_2008 %>% mutate(Education = as.integer(Education)),
+  elsa10 = ELSA_2010 %>% mutate(Education = as.integer(Education)),
+  elsa12 = ELSA_2012,
+  elsa14 = ELSA_2014,
+  elsa16 = ELSA_2016,
+  elsa18 = ELSA_2018
+)
+
+elsa_long <- bind_rows(dat_list, .id = "source") %>%
+  mutate(
+    idauniq = as.character(idauniq),
+    year    = as.integer(year)
+  )
+
+elsa_long <- elsa_long %>%
+  mutate(
+    age = coalesce(age_2004, age_2006, age_2008, age_2010,
+                   age_2012, age_2014, age_2016, age_2018)
+  ) %>%
+  select(-matches("^age_\\d{4}$"))
+
+write.csv(elsa_long,
+          file = "elsa_long.csv",
+          row.names = FALSE)
+
+```

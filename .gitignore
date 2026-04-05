@@ -1,0 +1,25 @@
+# ── ELSA raw data (UKDA-5050 EUL prohibits redistribution) ──────────────────
+*.dta
+*.sav
+*.sas7bdat
+elsa_long.csv
+data/
+raw/
+
+# ── R artefacts ──────────────────────────────────────────────────────────────
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+*.nb.html
+
+# ── Local environment (contains your data path — never commit) ───────────────
+.Renviron
+
+# ── MICE / imputation objects ────────────────────────────────────────────────
+*.rds
+*.RData
+
+# ── OS noise ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

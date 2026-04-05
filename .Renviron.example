@@ -1,0 +1,10 @@
+# ── ELSA Data Directory ───────────────────────────────────────────────────────
+# Copy this file to .Renviron in your project root (or append to ~/.Renviron).
+# .Renviron is listed in .gitignore and will NOT be committed to Git.
+#
+# Set this to the full path of your UKDA-5050 Stata directory:
+#   macOS / Linux:  /path/to/UKDA-5050-stata/stata/stata13_se
+#   Windows:        C:/path/to/UKDA-5050-stata/stata/stata13_se
+# ─────────────────────────────────────────────────────────────────────────────
+
+ELSA_DATA_DIR=
